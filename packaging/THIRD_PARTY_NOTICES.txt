@@ -1,0 +1,40 @@
+Z Calculator 1.0.0 - third-party notices
+
+This directory contains the license and notice files provided by the installed
+Python dependency distributions, their package metadata, the Python license,
+and the GNU LGPL version 3 / GPL version 3 license texts.
+package-versions.json identifies the versions used for this build.
+
+Qt for Python / Qt / Shiboken
+---------------------------
+Z Calculator uses unmodified PySide6 Essentials and Shiboken6, with shared Qt
+libraries, under the GNU Lesser General Public License version 3 (LGPLv3).
+The Qt libraries and bindings remain separate dynamically loaded files in
+_internal/PySide6 and _internal/shiboken6. Compatible modified versions may
+replace these files. Modification of these libraries and reverse engineering
+for debugging such modifications are permitted under their license terms.
+The application does not impose additional restrictions on these activities.
+
+The commercial-license reference files supplied by the installed wheels are
+retained for completeness; they do not replace the LGPL licensing option
+declared in the distributions' METADATA files.
+
+Corresponding unmodified sources and build instructions:
+  Qt: https://download.qt.io/archive/qt/
+  Qt source repositories: https://code.qt.io/cgit/qt/
+  PySide6 / Shiboken6 source: https://code.qt.io/cgit/pyside/pyside-setup.git/
+  Qt for Python build instructions:
+    https://doc.qt.io/qtforpython-6/building_from_source/index.html
+Use the matching release versions recorded in package-versions.json.
+
+License text sources:
+  https://www.gnu.org/licenses/lgpl-3.0.txt
+  https://www.gnu.org/licenses/gpl-3.0.txt
+
+Other dependencies
+------------------
+Python, NumPy, SciPy, python-pptx, lxml, Pillow, XlsxWriter, typing_extensions,
+and their bundled components retain their respective copyrights and licenses.
+The wheel-supplied license texts in the package subdirectories include notices
+for bundled native components such as BLAS/LAPACK and image/XML libraries.
+PyInstaller's COPYING notice includes its bootloader distribution exception.
