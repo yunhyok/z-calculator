@@ -4,7 +4,9 @@ A conforming, graded triangular P1 finite-element solution of div(eps grad V)=0
 provides C and dielectric energy participation. A second vacuum solve gives
 L_external = 1/(c**2 C_vacuum). The half-domain uses electric symmetry for
 an odd coupled mode, and magnetic symmetry for a single trace. Coupled results
-are DIFFERENTIAL (V_right - V_left)/I_right, not the odd-mode impedance.
+are DIFFERENTIAL (V_right - V_left)/I_right, not the odd-mode impedance. A
+second solve with magnetic symmetry gives the even mode of a pair, per line;
+both modes together give the four single-ended ports of the pair.
 Microstrip is exposed to air: top_um/top_er/top_df are ignored. Stripline's
 bottom_um and top_um are copper-face-to-plane distances. The two stripline
 dielectrics meet at copper mid-thickness outside the trace. Copper's bottom
@@ -121,8 +123,8 @@ class Geometry:
 class Result:
     frequency_hz: np.ndarray
     impedance_ohm: np.ndarray
-    return_loss_db: np.ndarray
-    insertion_loss_db: np.ndarray
+    s11_db: np.ndarray
+    s21_db: np.ndarray
     attenuation_db_m: np.ndarray
     dcr_ohm_m: float
     quasistatic_impedance_ohm: np.ndarray
@@ -136,6 +138,14 @@ class Result:
     s21: np.ndarray
     propagation_constant_m: np.ndarray
     warnings: tuple[str, ...]
+    # Single-ended ports, shape (frequencies, ports, ports); None without ports=True.
+    # Single line: port 1 near end, port 2 far end, each referenced to reference_ohm.
+    # Pair: ports 1/2 are the near/far end of one line and 3/4 of the other
+    # (through paths 1-2 and 3-4), each referenced to port_ohm = reference_ohm / 2.
+    s_parameters: np.ndarray | None = None
+    port_ohm: float | None = None
+    even_impedance_ohm: np.ndarray | None = None  # complex, per line; pairs only
+    even_propagation_constant_m: np.ndarray | None = None
 
 
 def _cosine_segment(a: float, b: float, count: int) -> np.ndarray:
@@ -158,7 +168,7 @@ def _outward(a: float, b: float, first_step: float) -> np.ndarray:
 
 
 class _Section:
-    def __init__(self, g: Geometry):
+    def __init__(self, g: Geometry, even: bool = False):
         # Coordinates are micrometres: electrostatic 2D energy is scale invariant.
         w, t, h = g.width_um, g.thickness_um, g.bottom_um
         inner = g.gap_um / 2 if g.coupled else 0.0
@@ -212,7 +222,7 @@ class _Section:
         ground = row == 0
         if g.stripline:
             ground |= row == ny - 1
-        if g.coupled:
+        if g.coupled and not even:
             ground |= column == 0  # odd-mode symmetry plane: zero potential, not metal
         if g.shield:
             ground |= copper_rows & (column >= rail_column)
@@ -223,7 +233,9 @@ class _Section:
         self.unknown = np.flatnonzero(~(signal | ground))
         self.rows = np.repeat(self.tri, 3, axis=1).ravel()
         self.cols = np.tile(self.tri, (1, 3)).ravel()
-        self.factor = 0.5 if g.coupled else 2.0
+        # The half-domain energy is half a single line, one line of an even
+        # mode, or twice the differential capacitance of an odd mode.
+        self.factor = (1.0 if even else 0.5) if g.coupled else 2.0
         bottom, top, potential = self.solve(1.0, 1.0)
         # Wheeler's incremental-inductance rule: R_hf = (Rs/mu0) dL/dn with every
         # metal surface receding by n. With L = 1/(c^2 C) this is the shape derivative
@@ -289,9 +301,9 @@ class _Section:
         return energy[self.lower].sum(), energy[~self.lower].sum(), potential
 
 
-@lru_cache(maxsize=8)
-def _section(g: Geometry) -> _Section:
-    return _Section(g)
+@lru_cache(maxsize=16)
+def _section(g: Geometry, even: bool = False) -> _Section:
+    return _Section(g, even)
 
 
 def _array(value, frequency: np.ndarray, label: str, low: float, high: float) -> np.ndarray:
@@ -327,17 +339,68 @@ def _capacitances(section: _Section, eb: np.ndarray, et: np.ndarray):
     return bottom * et, top * et
 
 
+@dataclass
+class _Line:
+    """Per-unit-length parameters of one mode."""
+    resistance: np.ndarray
+    inductance: np.ndarray
+    conductance: np.ndarray
+    capacitance: np.ndarray
+    vacuum_capacitance: float
+    impedance: np.ndarray  # complex characteristic impedance
+    gamma: np.ndarray  # complex propagation constant, 1/m
+
+    @property
+    def external_inductance(self) -> float:
+        return 1 / (C0 ** 2 * self.vacuum_capacitance)
+
+
+def _line(section: _Section, f, eb, db, et, dt, rdc: float) -> _Line:
+    """RLGC of the mode a section was solved for; rdc is the DC resistance of its current path."""
+    cb, ct = _capacitances(section, eb, et)
+    capacitance = cb + ct
+    cvac = sum(section.vacuum[:2])
+    omega = 2 * np.pi * f
+    conductance = omega * (cb * db + ct * dt)
+    # Skin effect: the resistance rises from rdc to Rs(f) * surface_factor, Rs = sqrt(pi f mu0 rho),
+    # and the same internal impedance adds inductance. A slab of equivalent thickness joins the
+    # two limits; where the skin depth is near the copper thickness this crossover is an
+    # estimate, not a diffusion solve.
+    depth = section.vacuum[2] * COPPER_RHO / rdc
+    z = np.sqrt(1j * omega * MU0 / COPPER_RHO) * depth
+    internal = rdc * z
+    transition = z.real < 20
+    internal[transition] /= np.tanh(z[transition])
+    inductance = 1 / (C0 ** 2 * cvac) + internal.imag / omega
+    series = internal.real + 1j * omega * inductance
+    shunt = conductance + 1j * omega * capacitance
+    return _Line(internal.real, inductance, conductance, capacitance, cvac,
+                 np.sqrt(series / shunt), np.sqrt(series * shunt))
+
+
+def _two_port(impedance, gamma, length_m: float, reference_ohm: float):
+    """S11 and S21 of a uniform line between two equal real reference impedances."""
+    # Decaying-wave formulation avoids cosh/sinh overflow on long/lossy lines.
+    rho = (impedance - reference_ohm) / (impedance + reference_ohm)
+    travel = np.exp(-gamma * length_m)
+    denominator = 1 - rho ** 2 * travel ** 2
+    return rho * (1 - travel ** 2) / denominator, (1 - rho ** 2) * travel / denominator
+
+
 def analyze(geometry: Geometry, freq_hz, bottom_er=4.2, bottom_df=0.02,
-            top_er=4.2, top_df=0.02, length_m=0.1, reference_ohm=50.0) -> Result:
+            top_er=4.2, top_df=0.02, length_m=0.1, reference_ohm=50.0, ports=True) -> Result:
     """Analyze a single or odd differential line; both ports use reference_ohm.
 
     impedance_ohm is Re(Zc) of lossy RLGC. quasistatic_impedance_ohm is
     sqrt(L_external/C), the geometric impedance often used for PCB synthesis.
-    S11/S21 include propagation, finite length and mismatch at both ends.
-    Return/insertion loss use positive -20 log10(abs(S)); matched S11 is capped
-    at 300 dB for plotting. Frequency must be strictly increasing and >0 Hz.
-    Result.warnings holds the keys of WARNINGS that apply. ValueError messages
-    are user-facing Korean text.
+    S11/S21 include propagation, finite length and mismatch at both ends;
+    s11_db and s21_db are 20 log10(abs(S)), so they are zero or negative, and a
+    matched S11 is floored at -300 dB for plotting. For a pair these are the
+    differential Sdd11/Sdd21 against the differential reference_ohm.
+    With ports=True, s_parameters holds the single-ended ports (see Result);
+    a pair then also needs its even mode. Frequency must be strictly increasing
+    and >0 Hz. Result.warnings holds the keys of WARNINGS that apply. ValueError
+    messages are user-facing Korean text.
     """
     geometry.validate()
     f = np.asarray(freq_hz, dtype=float)
@@ -352,37 +415,26 @@ def analyze(geometry: Geometry, freq_hz, bottom_er=4.2, bottom_df=0.02,
     db = _array(bottom_df, f, "하부 유전체 Df", 0, 1)
     et = _array(top_er, f, "상부 유전체 Dk", 1, 100) if geometry.stripline else np.ones_like(f)
     dt = _array(top_df, f, "상부 유전체 Df", 0, 1) if geometry.stripline else np.zeros_like(f)
-    section = _section(geometry)
-    cb, ct = _capacitances(section, eb, et)
-    capacitance = cb + ct
-    cvac = sum(section.vacuum[:2])
-    lexternal = 1 / (C0 ** 2 * cvac)
-    omega = 2 * np.pi * f
-    conductance = omega * (cb * db + ct * dt)
     area_m2 = (geometry.width_um + geometry.top_width_um) / 2 * geometry.thickness_um * 1e-12
     dcr = COPPER_RHO / area_m2
-    rdc_mode = dcr * (2 if geometry.coupled else 1)
-    surface_factor = section.vacuum[2]
-    # A slab of equivalent thickness joins DC resistance to the skin limit R = Rs * surface_factor.
-    # Between them (skin depth near copper thickness) this crossover is an estimate, not a diffusion solve.
-    depth = surface_factor * COPPER_RHO / rdc_mode
-    z = np.sqrt(1j * omega * MU0 / COPPER_RHO) * depth
-    internal = rdc_mode * z
-    transition = z.real < 20
-    internal[transition] /= np.tanh(z[transition])
-    inductance = lexternal + internal.imag / omega
-    resistance = internal.real
-    series = resistance + 1j * omega * inductance
-    shunt = conductance + 1j * omega * capacitance
-    zc = np.sqrt(series / shunt)
-    gamma = np.sqrt(series * shunt)
-    # Decaying-wave formulation avoids cosh/sinh overflow on long/lossy lines.
-    rho = (zc - reference_ohm) / (zc + reference_ohm)
-    travel = np.exp(-gamma * length_m)
-    denominator = 1 - rho ** 2 * travel ** 2
-    s21 = (1 - rho ** 2) * travel / denominator
-    s11 = rho * (1 - travel ** 2) / denominator
-    attenuation = 20 / np.log(10) * gamma.real
+    # The differential current returns through the other trace: two conductors in series.
+    line = _line(_section(geometry), f, eb, db, et, dt, dcr * (2 if geometry.coupled else 1))
+    s11, s21 = _two_port(line.impedance, line.gamma, length_m, reference_ohm)
+    s_parameters = port_ohm = even = None
+    if ports and geometry.coupled:
+        port_ohm = reference_ohm / 2
+        even = _line(_section(geometry, True), f, eb, db, et, dt, dcr)
+        e11, e21 = _two_port(even.impedance, even.gamma, length_m, port_ohm)
+        # Each line of the odd mode against port_ohm is the differential line against reference_ohm.
+        reflect, near = (e11 + s11) / 2, (e11 - s11) / 2
+        through, far = (e21 + s21) / 2, (e21 - s21) / 2
+        rows = [[reflect, through, near, far], [through, reflect, far, near],
+                [near, far, reflect, through], [far, near, through, reflect]]
+    elif ports:
+        port_ohm = reference_ohm
+        rows = [[s11, s21], [s21, s11]]
+    if ports:
+        s_parameters = np.moveaxis(np.array(rows), -1, 0)
     warnings = []
     dimension_m = (geometry.bottom_um + geometry.thickness_um +
                    (geometry.top_um if geometry.stripline else geometry.width_um)) * 1e-6
@@ -393,10 +445,13 @@ def analyze(geometry: Geometry, freq_hz, bottom_er=4.2, bottom_df=0.02,
     active = geometry.active_dimensions().values()
     if max(active) / min(active) > 100:
         warnings.append("aspect_ratio")
-    return Result(f.copy(), zc.real, -20 * np.log10(np.maximum(abs(s11), 1e-15)),
-                  -20 * np.log10(np.maximum(abs(s21), 1e-300)), attenuation, dcr,
-                  np.sqrt(lexternal / capacitance), zc, resistance, inductance,
-                  conductance, capacitance, capacitance / cvac, s11, s21, gamma, tuple(warnings))
+    return Result(f.copy(), line.impedance.real, 20 * np.log10(np.maximum(abs(s11), 1e-15)),
+                  20 * np.log10(np.maximum(abs(s21), 1e-300)), 20 / np.log(10) * line.gamma.real, dcr,
+                  np.sqrt(line.external_inductance / line.capacitance), line.impedance,
+                  line.resistance, line.inductance, line.conductance, line.capacitance,
+                  line.capacitance / line.vacuum_capacitance, s11, s21, line.gamma, tuple(warnings),
+                  s_parameters, port_ohm, None if even is None else even.impedance,
+                  None if even is None else even.gamma)
 
 
 def synthesize_width(geometry: Geometry, target_ohm: float, frequency_hz: float,
@@ -418,7 +473,7 @@ def synthesize_width(geometry: Geometry, target_ohm: float, frequency_hz: float,
 
     def error(width):
         result = analyze(replace(geometry, width_um=float(width)), [frequency_hz],
-                         bottom_er, bottom_df, top_er, top_df, length_m=0)
+                         bottom_er, bottom_df, top_er, top_df, length_m=0, ports=False)
         return float(result.impedance_ohm[0] - target_ohm)
 
     elo, ehi = error(lo), error(hi)

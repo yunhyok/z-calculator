@@ -10,23 +10,25 @@ import zipfile
 
 import numpy as np
 from pptx import Presentation
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QPoint, QSize, Qt
 from PySide6.QtGui import QImage
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from zcalc import engine, visuals
 from zcalc.engine import Geometry
-from zcalc.visuals import (LOG_X, METRICS, PlotWidget, Section, SectionWidget, Snapshot, _at_design,
-                           _FrequencyAxis, _image, _linear_ticks, _x_ticks, _y_ticks, save_png, save_pptx)
+from zcalc.visuals import (LOG_X, METRICS, PlotWidget, Section, SectionWidget, Snapshot, _at, _at_design,
+                           _FrequencyAxis, _image, _linear_ticks, _title, _values, _x_ticks, _y_ticks,
+                           save_png, save_pptx)
 
 
 def snapshot(kind="coupled_stripline", shield=True):
     f = np.geomspace(1e6, 1e10, 41)
     result = SimpleNamespace(
         impedance_ohm=100 + np.linspace(2, -2, f.size),
-        return_loss_db=20 + 3 * np.sin(np.linspace(0, 8, f.size)),
+        s11_db=-20 - 3 * np.sin(np.linspace(0, 8, f.size)),
         attenuation_db_m=np.sqrt(f / 1e9),
-        insertion_loss_db=.1 * np.sqrt(f / 1e9),
+        s21_db=-.1 * np.sqrt(f / 1e9),
         dcr_ohm_m=2.1,
         warnings=("wavelength",),
     )
@@ -89,7 +91,7 @@ class VisualTests(unittest.TestCase):
         self.assertEqual(log_axis.labels[0], "1 MHz")
 
     def test_loss_graphs_default_to_linear_frequency_and_can_switch(self):
-        self.assertEqual({key for key, log in LOG_X.items() if not log}, {"return", "attenuation", "insertion"})
+        self.assertEqual({key for key, log in LOG_X.items() if not log}, {"s11", "attenuation", "s21"})
         s = snapshot()
         for metric in METRICS:
             with self.subTest(metric=metric):
@@ -97,10 +99,10 @@ class VisualTests(unittest.TestCase):
                 self.assertEqual(default, _image(s, metric, LOG_X[metric]))
                 self.assertNotEqual(default, _image(s, metric, not LOG_X[metric]))
         widget = PlotWidget()
-        widget.set_metric("return")
+        widget.set_metric("s11")
         widget.set_log_x(True)
-        widget.set_metric("insertion")
-        self.assertEqual((widget.log_x["return"], widget.log_x["insertion"]), (True, False))
+        widget.set_metric("s21")
+        self.assertEqual((widget.log_x["s11"], widget.log_x["s21"]), (True, False))
 
     def test_section_is_drawn_from_inputs_without_a_result(self):
         section = Section(Geometry(kind="coupled_microstrip", shield=True), "직접 입력", "공기", 4.2, 1.0)
@@ -130,12 +132,12 @@ class VisualTests(unittest.TestCase):
                     for shield in (False, True):
                         save_png(Path(folder) / "section.png", snapshot(kind, shield), "section")
 
-    def test_compact_widget_and_infinite_return_loss(self):
+    def test_compact_widget_and_perfect_match(self):
         s = snapshot()
-        s.result.return_loss_db = np.full(s.freq_hz.shape, np.inf)
+        s.result.s11_db = np.full(s.freq_hz.shape, -np.inf)
         for widget in (SectionWidget(), PlotWidget()):
             if isinstance(widget, PlotWidget):
-                widget.set_metric("return")
+                widget.set_metric("s11")
                 widget.set_snapshot(s)
             else:
                 widget.set_section(s.section)
@@ -149,6 +151,51 @@ class VisualTests(unittest.TestCase):
     def test_every_engine_warning_has_display_text(self):
         self.assertEqual(set(visuals.WARNINGS), set(engine.WARNINGS))
         self.assertEqual(set(visuals.KINDS), set(engine.KINDS))
+
+    def test_s_parameter_graphs_are_negative_db_with_a_zero_ceiling(self):
+        s = snapshot()
+        low, high, ticks = _y_ticks(_values(s, "s21"))
+        self.assertEqual(high, 0)
+        self.assertLess(low, 0)
+        self.assertTrue(np.all(_values(s, "s11") < 0))
+        self.assertEqual((_title(s, "s11"), _title(s, "s21")), ("차동 반사 Sdd11", "차동 전송 Sdd21"))
+        single = snapshot("microstrip")
+        self.assertEqual((_title(single, "s11"), _title(single, "s21")), ("반사 S11", "전송 S21"))
+
+    def test_movable_marker_reads_the_curve_and_is_exported(self):
+        s = snapshot()
+        plain = _image(s, "s21")
+        self.assertNotEqual(_image(s, "s21", marker_hz=3e9), plain)
+        self.assertNotEqual(_image(s, "s21", marker_hz=3e9), _image(s, "s21", marker_hz=6e9))
+        self.assertEqual(_image(s, "s21", marker_hz=1e12), plain)  # outside the sweep: not drawn
+        self.assertAlmostEqual(_at(s, _values(s, "attenuation"), 4e9), 2, delta=0.02)
+        widget = PlotWidget()
+        widget.set_metric("s21")
+        widget.set_snapshot(s)
+        for size in (QSize(900, 300), QSize(1100, 620)):  # compact and full drawing
+            widget.resize(size)
+            widget.set_marker(None)
+            widget.grab()
+            rect, axis = widget._plot
+            QTest.mouseClick(widget, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())
+            self.assertAlmostEqual(widget.marker_hz, axis.frequency(.5), delta=(axis.high - axis.low) / rect.width())
+            # Dragging past the edge stops at the end of the sweep; a right click removes the marker.
+            QTest.mousePress(widget, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())
+            QTest.mouseMove(widget, QPoint(int(rect.right()) + 40, int(rect.center().y())))
+            QTest.mouseRelease(widget, Qt.MouseButton.LeftButton, pos=QPoint(int(rect.right()) + 40, int(rect.center().y())))
+            self.assertEqual(widget.marker_hz, s.freq_hz[-1])
+            QTest.mouseClick(widget, Qt.MouseButton.LeftButton, pos=QPoint(2, 2))  # outside the plot area
+            self.assertEqual(widget.marker_hz, s.freq_hz[-1])
+            QTest.mouseClick(widget, Qt.MouseButton.RightButton, pos=rect.center().toPoint())
+            self.assertIsNone(widget.marker_hz)
+        widget.close()
+        with tempfile.TemporaryDirectory() as folder:
+            save_pptx(Path(folder) / "marker.pptx", s, marker_hz=2.5e9)
+            text = "\n".join(cell.text for slide in Presentation(Path(folder) / "marker.pptx").slides
+                             for shape in slide.shapes if shape.has_table
+                             for row in shape.table.rows for cell in row.cells)
+            self.assertIn("마커 2.5 GHz", text)
+            self.assertIn("Sdd21 (dB)", text)
 
     def test_stale_plot_is_marked(self):
         widget = PlotWidget()

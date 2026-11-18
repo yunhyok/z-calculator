@@ -12,8 +12,10 @@ from PySide6.QtWidgets import (
     QScrollArea, QSizePolicy, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from . import __version__
 from .engine import C0, Geometry, analyze, synthesize_width
 from .materials import load_cmx, manual_material
+from .touchstone import save_touchstone
 from .visuals import (KINDS, METRICS, WARNINGS, PlotWidget, Section, SectionWidget, Snapshot,
                       frequency_text, save_png, save_pptx)
 
@@ -311,6 +313,10 @@ class Window(QMainWindow):
         self.subtitle = label("전송선 단면 해석", "subtle")
         head.addWidget(self.subtitle)
         head.addStretch()
+        self.touchstone_button = QPushButton("Touchstone")
+        self.touchstone_button.setToolTip("S파라미터를 Touchstone 파일로 저장합니다. 단일 선로는 .s2p, 차동쌍은 단일 종단 4포트 .s4p입니다.")
+        head.addWidget(self.touchstone_button)
+        self.touchstone_button.clicked.connect(self.export_touchstone)
         self.report_button = QPushButton("PowerPoint 보고서")
         self.report_button.setToolTip("조건·단면·전체 그래프·수치·모델 가정을 담은 .pptx를 저장합니다.")
         head.addWidget(self.report_button)
@@ -480,7 +486,7 @@ class Window(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(6)
         self.stat_labels, self.stat_values = [], []
-        for i, caption in enumerate(["특성 임피던스", "도선 DCR (1가닥)", "반사 손실", "삽입 손실"]):
+        for i, caption in enumerate(["특성 임피던스", "도선 DCR (1가닥)", "반사 S11", "전송 S21"]):
             box = QFrame()
             box.setObjectName("stat")
             col = QVBoxLayout(box)
@@ -563,7 +569,7 @@ class Window(QMainWindow):
         self.geometry_note.setText("상·하 기준면 거리는 도선 표면에서 측정합니다." if strip else
                                    "도선 위는 공기입니다. H₁은 하부 접지면까지의 거리입니다.")
         self.port_note.setText(("차동 포트" if pair else "단일 종단 포트") +
-                               " 기준입니다. 반사·삽입 손실은 지정한 길이와 양단 임피던스를 사용합니다.")
+                               " 기준입니다. S11·S21은 지정한 길이와 양단 임피던스를 사용합니다.")
         self.mark_dirty()
 
     def mode_changed(self):
@@ -639,6 +645,7 @@ class Window(QMainWindow):
         fresh = idle and self.snapshot is not None and not self.dirty
         self.png_button.setEnabled(fresh)
         self.report_button.setEnabled(fresh)
+        self.touchstone_button.setEnabled(fresh)
         self.section_save.setEnabled(idle and self.section_ok)
 
     def mark_dirty(self):
@@ -759,11 +766,12 @@ class Window(QMainWindow):
         i = int(np.argmin(abs(snap.freq_hz - snap.design_hz)))
         r = snap.result
         pair = "coupled" in snap.geometry.kind
-        self.stat_labels[0].setText("차동 임피던스" if pair else "특성 임피던스")
-        for widget, v, unit in zip(self.stat_values, [r.impedance_ohm[i], r.dcr_ohm_m,
-                                                     r.return_loss_db[i], r.insertion_loss_db[i]],
+        for caption, text in zip(self.stat_labels, ["차동 임피던스", "도선 DCR (1가닥)", "반사 Sdd11", "전송 Sdd21"] if pair
+                                 else ["특성 임피던스", "도선 DCR (1가닥)", "반사 S11", "전송 S21"]):
+            caption.setText(text)
+        for widget, v, unit in zip(self.stat_values, [r.impedance_ohm[i], r.dcr_ohm_m, r.s11_db[i], r.s21_db[i]],
                                    ["Ω", "Ω/m", "dB", "dB"]):
-            text = f"{v:.4g} {unit}" if np.isfinite(v) else f"∞ {unit}"
+            text = f"{v:.4g} {unit}"
             widget.setText(text)
             widget.setToolTip(text)
         self.condition.setText(f"{snap.design_hz / 1e9:g} GHz   ·   {snap.length_m * 1000:g} mm")
@@ -805,10 +813,65 @@ class Window(QMainWindow):
                 return
         try:
             if report:
-                save_pptx(path, content, self.plot.log_x)
+                save_pptx(path, content, self.plot.log_x, self.plot.marker_hz)
             else:
-                save_png(path, content, metric, None if section else self.plot.log_x[metric])
+                save_png(path, content, metric, None if section else self.plot.log_x[metric],
+                         None if section else self.plot.marker_hz)
             self.settings.setValue("exports/directory", str(path.parent))
+            self.set_status(f"저장 완료   ·   {path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "저장 실패", str(exc))
+
+    def touchstone_comments(self, snap):
+        """Header comments of a Touchstone file: what was calculated, in ASCII."""
+        g, i = snap.geometry, int(np.argmin(abs(snap.freq_hz - snap.design_hz)))
+        strip, pair = "stripline" in g.kind, "coupled" in g.kind
+        name = lambda text: "manual entry" if text == MANUAL else text
+        dimensions = f"W = {g.width_um:.6g} um (bottom), T = {g.thickness_um:g} um, sidewall {g.angle_deg:g} deg, H1 = {g.bottom_um:g} um"
+        if strip:
+            dimensions += f", H2 = {g.top_um:g} um"
+        if pair:
+            dimensions += f", S = {g.gap_um:g} um"
+        if g.shield:
+            dimensions += f", grounded shield at G = {g.clearance_um:g} um"
+        materials = f"Bottom dielectric: {name(snap.bottom_name)} (Dk {snap.bottom_er[i]:.4g}, Df {snap.bottom_df[i]:.4g} at {snap.design_hz / 1e9:g} GHz)"
+        materials += (f"; top dielectric: {name(snap.top_name)} (Dk {snap.top_er[i]:.4g}, Df {snap.top_df[i]:.4g})"
+                      if strip else "; air above the trace")
+        ports = (f"Single-ended ports of {snap.result.port_ohm:g} ohm (differential {snap.reference_ohm:g} ohm)"
+                 if pair else f"Ports of {snap.result.port_ohm:g} ohm")
+        return [f"Z Calculator {__version__}: {g.kind.replace('_', ' ')}, uniform line of {snap.length_m * 1000:g} mm",
+                dimensions, materials, ports,
+                "Quasi-TEM model: smooth copper at 20 C with skin effect, no roughness, vias, connectors or radiation"]
+
+    def export_touchstone(self):
+        if self.dirty or self.snapshot is None or self.snapshot.result.s_parameters is None:
+            return
+        snap = self.snapshot
+        ports = snap.result.s_parameters.shape[-1]
+        ext = f"s{ports}p"
+        # Tools number the four ports of a pair in two ways; the save dialog offers both.
+        orders = {f"Touchstone {ports}포트 (*.{ext})": "1-2"} if ports == 2 else {
+            f"Touchstone 4포트 · 통과 1→2, 3→4 (*.{ext})": "1-2",
+            f"Touchstone 4포트 · 통과 1→3, 2→4 (*.{ext})": "1-3"}
+        directory = self.settings.value("exports/directory", str(Path.home() / "Documents"), type=str)
+        previous = self.settings.value("exports/portOrder", "1-2", type=str)
+        chosen, selected = QFileDialog.getSaveFileName(
+            self, "Touchstone 저장", str(Path(directory) / f"Z-Calculator-{snap.geometry.kind}.{ext}"),
+            ";;".join(orders), next((name for name, order in orders.items() if order == previous), ""))
+        if not chosen:
+            return
+        path = Path(chosen)
+        if path.suffix.lower() != "." + ext:
+            path = Path(str(path) + "." + ext)
+            if path.exists() and QMessageBox.question(self, "기존 파일 교체", f"{path.name} 파일을 교체할까요?") != QMessageBox.StandardButton.Yes:
+                return
+        order = orders.get(selected, "1-2")
+        try:
+            save_touchstone(path, snap.freq_hz, snap.result.s_parameters, snap.result.port_ohm,
+                            self.touchstone_comments(snap), order)
+            self.settings.setValue("exports/directory", str(path.parent))
+            if ports == 4:
+                self.settings.setValue("exports/portOrder", order)
             self.set_status(f"저장 완료   ·   {path}")
         except Exception as exc:
             QMessageBox.warning(self, "저장 실패", str(exc))

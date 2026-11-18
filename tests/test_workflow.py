@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog
 from pptx import Presentation
@@ -178,15 +178,15 @@ class DesktopWorkflow(unittest.TestCase):
         self.assertFalse(window.plot.stale)
         self.assertTrue(window.stale_note.isHidden())
         # Loss graphs open on a linear frequency axis; each graph remembers its own choice.
-        expected = {"impedance": True, "dcr": True, "return": False, "attenuation": False, "insertion": False}
+        expected = {"impedance": True, "dcr": True, "s11": False, "attenuation": False, "s21": False}
         for key, log in expected.items():
             self.select(window.metric_selector, key)
             self.assertEqual(window.log_axis.isChecked(), log, key)
         window.log_axis.setChecked(True)
-        self.assertTrue(window.plot.log_x["insertion"])
-        self.select(window.metric_selector, "return")
+        self.assertTrue(window.plot.log_x["s21"])
+        self.select(window.metric_selector, "s11")
         self.assertFalse(window.log_axis.isChecked())
-        self.select(window.metric_selector, "insertion")
+        self.select(window.metric_selector, "s21")
         self.assertTrue(window.log_axis.isChecked())
         linear = np.diff(window.snapshot.freq_hz)
         self.assertLess(linear.max(), (window.snapshot.freq_hz[-1] - window.snapshot.freq_hz[0]) / 399)
@@ -201,3 +201,53 @@ class DesktopWorkflow(unittest.TestCase):
         self.assertFalse(window.plot.stale)
         self.assertTrue(window.stale_note.isHidden())
         self.assertTrue(window.png_button.isEnabled())
+
+    def test_s_parameters_marker_and_touchstone_export(self):
+        window = self.window
+        window.show()
+        self.calculate()
+        result = window.snapshot.result
+        # The tiles show S11 and S21 in dB, which are negative.
+        self.assertEqual([label.text() for label in window.stat_labels[2:]], ["반사 S11", "전송 S21"])
+        for tile, value in zip(window.stat_values[2:], (result.s11_db, result.s21_db)):
+            self.assertTrue(tile.text().startswith("-") and tile.text().endswith(" dB"), tile.text())
+            self.assertLess(value.max(), 0)
+        # A marker placed in the graph is carried into the exported picture.
+        self.select(window.metric_selector, "s21")
+        window.plot.grab()
+        rect, axis = window.plot._plot
+        QTest.mouseClick(window.plot, Qt.MouseButton.LeftButton, pos=rect.center().toPoint())
+        self.assertAlmostEqual(window.plot.marker_hz, 1e10, delta=2e8)
+        marked = self.save("marked.png", False).read_bytes()
+        window.plot.set_marker(None)
+        self.assertNotEqual(self.save("plain.png", False).read_bytes(), marked)
+        # Touchstone: two ports for a single line.
+        path = self.folder / "line.s2p"
+        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(path), "")):
+            window.export_touchstone()
+        lines = path.read_text(encoding="ascii").splitlines()
+        data = [line for line in lines if line[0] not in "!#"]
+        self.assertIn("# Hz S RI R 50", lines)
+        self.assertEqual(len(data), len(window.snapshot.freq_hz))
+        self.assertEqual(len(data[0].split()), 9)
+        self.assertTrue(any("Port 2: far end" in line for line in lines))
+        # Four single-ended ports for a pair, with either port numbering.
+        self.select(window.kind, "coupled_microstrip")
+        self.assertFalse(window.touchstone_button.isEnabled())
+        self.calculate()
+        self.assertEqual([label.text() for label in window.stat_labels[2:]], ["반사 Sdd11", "전송 Sdd21"])
+        texts = {}
+        for order in ("1→2, 3→4", "1→3, 2→4"):
+            path = self.folder / f"pair-{order[:3]}.s4p"
+            with patch.object(QFileDialog, "getSaveFileName") as dialog:
+                dialog.side_effect = lambda *arguments: (str(path), next(
+                    name for name in arguments[3].split(";;") if order in name))
+                window.export_touchstone()
+            texts[order] = path.read_text(encoding="ascii").splitlines()
+        self.assertEqual(window.settings.value("exports/portOrder"), "1-3")  # offered first next time
+        first, second = texts.values()
+        self.assertIn("# Hz S RI R 50", first)
+        self.assertEqual(len([line for line in first if line[0] not in "!#"]), 4 * len(window.snapshot.freq_hz))
+        self.assertIn("! Port 2: line + (far end)", first)
+        self.assertIn("! Port 2: line - (near end)", second)
+        self.assertNotEqual(first, second)

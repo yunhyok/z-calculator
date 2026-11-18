@@ -97,7 +97,7 @@ for group in table:
                 source = Path(item[1]).resolve()
                 assert any(source.is_relative_to(base) for base in allowed), f"Foreign native library: {source}"
 archive = ZlibArchiveReader(str(root / "build/pyinstaller/ZCalculator/PYZ-00.pyz"))
-for name in ["zcalc.visuals", "zcalc.ui", "zcalc.engine", "zcalc.materials"]:
+for name in ["zcalc.visuals", "zcalc.ui", "zcalc.engine", "zcalc.materials", "zcalc.touchstone"]:
     code = archive.extract(name)
     source = root / (name.replace(".", "/") + ".py")
     assert code == compile(source.read_text(encoding="utf-8"), code.co_filename, "exec"), f"Stale frozen source: {name}"
@@ -108,7 +108,7 @@ print("Frozen source and native-library provenance checks passed.")
 
     & $InnoCompiler /Qp "packaging\installer.iss"
     if ($LASTEXITCODE) { throw "Inno Setup failed." }
-    $installer = Join-Path $projectRoot "dist\Z-Calculator-1.1.0-Windows-x64-Setup.exe"
+    $installer = Join-Path $projectRoot "dist\Z-Calculator-1.2.0-Windows-x64-Setup.exe"
     Get-FileHash -Algorithm SHA256 -LiteralPath $installer
     Write-Host "Installer: $installer"
 }
