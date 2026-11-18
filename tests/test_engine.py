@@ -22,16 +22,17 @@ def hammerstad_jensen_zero_thickness(u, er):
         fu / u + math.sqrt(1 + (2 / u) ** 2))
 
 
-def cohn_stripline(width, spacing, er, gap=None):
+def cohn_stripline(width, spacing, er, gap=None, even=False):
     """Exact zero-thickness stripline between planes `spacing` apart.
 
     Single strip: S. B. Cohn, IRE Trans. MTT 2(2), 1954, DOI 10.1109/TMTT.1954.1124875.
-    With `gap`, the odd-mode impedance of an edge-coupled pair: Cohn, IRE Trans.
-    MTT 3(5), 1955, DOI 10.1109/TMTT.1955.1124973.
+    With `gap`, the odd-mode (or even-mode) impedance of an edge-coupled pair:
+    Cohn, IRE Trans. MTT 3(5), 1955, DOI 10.1109/TMTT.1955.1124973.
     """
     k = math.tanh(math.pi * width / (2 * spacing))
     if gap is not None:
-        k /= math.tanh(math.pi * (width + gap) / (2 * spacing))
+        coupling = math.tanh(math.pi * (width + gap) / (2 * spacing))
+        k = k * coupling if even else k / coupling
     return 30 * math.pi / math.sqrt(er) * ellipk(1 - k * k) / ellipk(k * k)
 
 
@@ -93,6 +94,10 @@ class EngineTests(unittest.TestCase):
                 actual = analyze(g, [1e9], 4, 0, 4, 0).quasistatic_impedance_ohm[0]
                 expected = 2 * cohn_stripline(ratio * spacing, spacing, 4, gap_ratio * spacing)
                 self.assertTrue(-0.01 < actual / expected - 1 <= 0, actual / expected - 1)
+                # Even mode, per line. At 1 THz the internal inductance of the copper is negligible.
+                even = abs(analyze(g, [1e12], 4, 0, 4, 0).even_impedance_ohm[0])
+                expected = cohn_stripline(ratio * spacing, spacing, 4, gap_ratio * spacing, even=True)
+                self.assertTrue(-0.01 < even / expected - 1 <= 0, even / expected - 1)
 
     def test_homogeneous_tem_scaling_and_parallel_plate_limit(self):
         g = Geometry(kind="stripline", width_um=10000, thickness_um=1)
@@ -215,13 +220,59 @@ class EngineTests(unittest.TestCase):
                 self.assertTrue(np.all(abs(result.s11) ** 2 + abs(result.s21) ** 2 <= 1 + 1e-12))
                 self.assertTrue(np.all(result.attenuation_db_m > 0))
 
+    def test_s_parameters_in_db_are_not_positive(self):
+        for kind in KINDS:
+            with self.subTest(kind=kind):
+                result = analyze(Geometry(kind=kind), np.geomspace(1e6, 4e10, 60), 4, 0.02, 3.5, 0.01,
+                                 length_m=0.1, reference_ohm=60)
+                np.testing.assert_allclose(result.s11_db, 20 * np.log10(abs(result.s11)))
+                np.testing.assert_allclose(result.s21_db, 20 * np.log10(abs(result.s21)))
+                self.assertTrue(np.all(result.s11_db < 0) and np.all(result.s21_db < 0))
+
+    def test_single_ended_ports_of_line_and_pair(self):
+        f = np.linspace(1e8, 2e10, 80)
+        single = analyze(Geometry(), f, 4.2, 0.018, length_m=0.05, reference_ohm=50)
+        self.assertEqual((single.s_parameters.shape, single.port_ohm), ((80, 2, 2), 50))
+        np.testing.assert_array_equal(single.s_parameters[:, 1, 0], single.s21)
+        np.testing.assert_array_equal(single.s_parameters[:, 0, 0], single.s_parameters[:, 1, 1])
+        self.assertIsNone(single.even_impedance_ohm)
+        self.assertIsNone(analyze(Geometry(), f, ports=False).s_parameters)
+        for kind in ("coupled_microstrip", "coupled_stripline"):
+            with self.subTest(kind=kind):
+                g = Geometry(kind=kind, width_um=120, gap_um=90, thickness_um=30, angle_deg=75)
+                pair = analyze(g, f, 4.1, 0.02, 3.6, 0.01, length_m=0.08, reference_ohm=100)
+                s = pair.s_parameters
+                self.assertEqual((s.shape, pair.port_ohm), ((80, 4, 4), 50))
+                np.testing.assert_array_equal(s, s.transpose(0, 2, 1))  # reciprocal
+                self.assertLessEqual(np.linalg.svd(s, compute_uv=False).max(), 1)  # passive
+                # Ports 1/3 are the near-end pair and 2/4 the far-end pair: the differential
+                # combination recovers the differential two-port.
+                np.testing.assert_allclose((s[:, 0, 0] - s[:, 0, 2] - s[:, 2, 0] + s[:, 2, 2]) / 2, pair.s11, atol=1e-15)
+                np.testing.assert_allclose((s[:, 1, 0] - s[:, 1, 2] - s[:, 3, 0] + s[:, 3, 2]) / 2, pair.s21, atol=1e-15)
+                self.assertTrue(np.all(pair.even_impedance_ohm.real > pair.complex_impedance_ohm.real / 2))
+        # Far apart, each line of a pair behaves as the single line and nothing couples.
+        apart = analyze(Geometry(kind="coupled_microstrip", gap_um=20000), f, 4.2, 0.018,
+                        length_m=0.05, reference_ohm=100)
+        np.testing.assert_allclose(apart.even_impedance_ohm, single.complex_impedance_ohm, rtol=0.005)
+        # (Magnitudes: a 0.2% difference in velocity between two grids adds up in phase.)
+        np.testing.assert_allclose(abs(apart.s_parameters[:, 1, 0]), abs(single.s21), rtol=0.01)
+        self.assertLess(abs(apart.s_parameters[:, 2:, 0]).max(), 1e-3)
+        # A homogeneous dielectric gives both modes one velocity. Microstrip does not: its even
+        # mode is slower, which is what makes its far-end crosstalk large.
+        strip, micro = (analyze(Geometry(kind=kind, width_um=120, gap_um=90, thickness_um=18), f, 4, 0.01, 4, 0.01,
+                                length_m=0.08, reference_ohm=100) for kind in ("coupled_stripline", "coupled_microstrip"))
+        slowness = lambda r: (r.even_propagation_constant_m.imag / r.propagation_constant_m.imag)[-1]
+        self.assertAlmostEqual(slowness(strip), 1, delta=0.005)
+        self.assertGreater(slowness(micro), 1.05)
+        self.assertLess(abs(strip.s_parameters[:, 3, 0]).max(), 0.1 * abs(micro.s_parameters[:, 3, 0]).max())
+
     def test_zero_length_and_very_long_line_stay_finite(self):
         zero = analyze(Geometry(), [1e6, 1e9], length_m=0)
         np.testing.assert_array_equal(zero.s11, 0)
         np.testing.assert_allclose(zero.s21, 1, atol=2e-15)
         with np.errstate(over="raise", invalid="raise", divide="raise"):
             long = analyze(Geometry(thickness_um=1000), [1e-3, 1e15], length_m=1e6)
-        for output in (long.s11, long.s21, long.insertion_loss_db, long.return_loss_db):
+        for output in (long.s11, long.s21, long.s21_db, long.s11_db, long.s_parameters):
             self.assertTrue(np.all(np.isfinite(output)))
         self.assertEqual(long.s21[-1], 0)
 

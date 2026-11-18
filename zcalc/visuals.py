@@ -11,7 +11,7 @@ import tempfile
 from typing import Any
 
 import numpy as np
-from PySide6.QtCore import QLineF, QPointF, QRectF, QSize, Qt
+from PySide6.QtCore import QLineF, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QApplication, QSizePolicy, QWidget
 
@@ -24,6 +24,7 @@ MUTED = "#b9c0ca"
 BLUE = "#8fc1ff"
 STALE = "#5d7694"
 AMBER = "#f0c27a"
+MARKER = "#8fe3b0"
 COPPER = "#dfaa70"
 GRID = "#3d444f"
 
@@ -37,12 +38,12 @@ KINDS = {
 METRICS = {
     "impedance": ("특성 임피던스", "Ω", "impedance_ohm"),
     "dcr": ("단위 길이당 DCR", "Ω/m", "dcr_ohm_m"),
-    "return": ("반사 손실 RL", "dB", "return_loss_db"),
+    "s11": ("반사 S11", "dB", "s11_db"),
     "attenuation": ("단위 길이당 전파 손실", "dB/m", "attenuation_db_m"),
-    "insertion": ("지정 길이 삽입 손실 IL", "dB", "insertion_loss_db"),
+    "s21": ("전송 S21", "dB", "s21_db"),
 }
-# Default frequency axis: S-parameter style losses read best on a linear axis.
-LOG_X = {"impedance": True, "dcr": True, "return": False, "attenuation": False, "insertion": False}
+# Default frequency axis: S-parameters and loss read best on a linear axis.
+LOG_X = {"impedance": True, "dcr": True, "s11": False, "attenuation": False, "s21": False}
 # engine.WARNINGS key: (status-bar phrase, report sentence)
 WARNINGS = {
     "wavelength": ("단면이 파장의 1/10 초과 · 전파 해석 검증 필요",
@@ -109,11 +110,13 @@ class Snapshot:
                        _at_design(self, self.bottom_er), _at_design(self, self.top_er))
 
 
-def frequency_text(value: float) -> str:
+def frequency_text(value: float, digits: int | None = None) -> str:
+    """Frequency with its unit; digits limits the significant digits (e.g. a dragged marker)."""
+    form = "g" if digits is None else f".{digits}g"
     for divisor, unit in ((1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz")):
         if value >= divisor:
-            return f"{value / divisor:g} {unit}"
-    return f"{value:g} Hz"
+            return f"{value / divisor:{form}} {unit}"
+    return f"{value:{form}} Hz"
 
 
 def _number(value: float, precision: int = 4) -> str:
@@ -145,9 +148,17 @@ def _at_design(snapshot: Snapshot, values: np.ndarray) -> float:
 
 
 def _title(snapshot: Snapshot, metric: str) -> str:
+    pair = snapshot.geometry.kind.startswith("coupled_")
     if metric == "impedance":
-        return "차동 임피던스 Re(Zc)" if snapshot.geometry.kind.startswith("coupled_") else "특성 임피던스 Re(Zc)"
+        return "차동 임피던스 Re(Zc)" if pair else "특성 임피던스 Re(Zc)"
+    if pair and metric in ("s11", "s21"):
+        return {"s11": "차동 반사 Sdd11", "s21": "차동 전송 Sdd21"}[metric]
     return METRICS[metric][0]
+
+
+def _at(snapshot: Snapshot, values: np.ndarray, frequency_hz: float) -> float:
+    """Value of a curve at any frequency inside the sweep."""
+    return float(np.interp(frequency_hz, snapshot.freq_hz, values))
 
 
 def _font(size: float, bold: bool = False) -> QFont:
@@ -419,6 +430,8 @@ def _y_ticks(values: np.ndarray):
     low, high = low - pad, high + pad
     if finite.min() >= 0:
         low = max(0.0, low)
+    if finite.max() <= 0:  # S-parameters in dB never exceed 0
+        high = min(0.0, high)
     raw = (high - low) / 5
     power = 10 ** math.floor(math.log10(raw))
     step = next(x for x in (1, 2, 2.5, 5, 10) if x * power >= raw) * power
@@ -495,16 +508,96 @@ class _FrequencyAxis:
             return math.log(frequency / self.low) / math.log(self.high / self.low)
         return (frequency - self.low) / (self.high - self.low)
 
+    def frequency(self, position: float) -> float:
+        """Inverse of position."""
+        if self.log:
+            return self.low * (self.high / self.low) ** position
+        return self.low + position * (self.high - self.low)
+
 
 class PlotWidget(_DrawingWidget):
+    """Frequency response with the design-frequency marker and one movable marker.
+
+    Clicking or dragging in the plot places the movable marker; a right click
+    removes it. It keeps its frequency across graphs and calculations.
+    """
     placeholder = "계산을 실행하면 주파수 응답이 표시됩니다."
+    marker_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.metric_key = "impedance"
         self.log_x = dict(LOG_X)
         self.stale = False
+        self.marker_hz: float | None = None
+        self._plot = None  # (plot rectangle in widget coordinates, frequency axis) of the last paint
+        self._dragging = False
+        self.setMouseTracking(True)
+        self.setToolTip("그래프를 클릭하거나 끌면 마커를 놓습니다. 오른쪽 클릭으로 지웁니다.")
         self.setAccessibleName("주파수별 전송선 그래프")
+
+    def set_marker(self, frequency_hz: float | None):
+        """Place the movable marker, or remove it with None."""
+        if frequency_hz != self.marker_hz:
+            self.marker_hz = frequency_hz
+            self.marker_changed.emit()
+            self.update()
+
+    def _marker_at(self, x: float) -> float | None:
+        """Frequency under a horizontal widget position, limited to the sweep."""
+        if self._plot is None or self.content is None:
+            return None
+        rect, axis = self._plot
+        position = min(1.0, max(0.0, (x - rect.left()) / rect.width()))
+        freq = self.content.freq_hz
+        return float(min(freq[-1], max(freq[0], axis.frequency(position))))
+
+    def _over_plot(self, point) -> bool:
+        return self._plot is not None and self.content is not None and self._plot[0].adjusted(-4, 0, 4, 0).contains(point)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            self.set_marker(None)
+        elif event.button() == Qt.MouseButton.LeftButton and self._over_plot(event.position()):
+            self._dragging = True
+            self.set_marker(self._marker_at(event.position().x()))
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            self.set_marker(self._marker_at(event.position().x()))
+        self.setCursor(Qt.CursorShape.SplitHCursor if self._dragging or self._over_plot(event.position())
+                       else Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+        super().mouseReleaseEvent(event)
+
+    def _draw_marker(self, p: QPainter, rect: QRectF, values: np.ndarray, px, py, unit: str,
+                     size: float, radius: float):
+        """Movable marker: line, point on the curve and a frequency/value readout."""
+        s = self.content
+        if self.marker_hz is None or not s.freq_hz[0] <= self.marker_hz <= s.freq_hz[-1]:
+            return
+        x, value = px(self.marker_hz), _at(s, values, self.marker_hz)
+        _line(p, x, rect.top(), x, rect.bottom(), MARKER, 1.2 * radius / 3.5)
+        if np.isfinite(value):
+            p.setPen(QPen(QColor(EDITOR), radius / 3))
+            p.setBrush(QColor(MARKER))
+            p.drawEllipse(QPointF(x, min(rect.bottom(), max(rect.top(), py(value)))), radius, radius)
+        text = f"{frequency_text(self.marker_hz, 4)}   {_number(value)} {unit}"
+        p.setFont(_font(size, True))
+        width = QFontMetricsF(p.font()).horizontalAdvance(text) + 14
+        height = size * 2.2
+        left = x + 7 if x + 7 + width <= rect.right() else x - 7 - width
+        box = QRectF(left, rect.top() + 4, width, height)
+        p.setPen(QPen(QColor(MARKER), 1))
+        p.setBrush(QColor(EDITOR))
+        p.drawRoundedRect(box, 3, 3)
+        p.setPen(QColor(MARKER))
+        p.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
 
     def set_snapshot(self, snapshot: Snapshot | None):
         self.set_content(snapshot)
@@ -552,6 +645,7 @@ class PlotWidget(_DrawingWidget):
         rect = QRectF(72, 49, width-95, height-104)
         low, high, ticks = _y_ticks(values)
         axis = _FrequencyAxis(s.freq_hz, self.log_x[self.metric_key])
+        self._plot = (QRectF(rect), axis)
         px = lambda f: rect.left() + axis.position(f)*rect.width()
         py = lambda value: rect.bottom() - (value-low)/(high-low)*rect.height()
         # A short plot keeps three horizontal labels at a readable fixed font size.
@@ -578,14 +672,17 @@ class PlotWidget(_DrawingWidget):
         if np.isfinite(design):
             p.setBrush(QColor(COPPER))
             p.drawEllipse(QPointF(x, py(design)), 3.5, 3.5)
+        self._draw_marker(p, rect, values, px, py, unit, 9, 3.5)
         p.restore()
         if not np.any(np.isfinite(values)):
-            _text(p, rect.x(), rect.y(), rect.width(), rect.height(), "∞ dB · 완전 정합", 12, BLUE,
+            _text(p, rect.x(), rect.y(), rect.width(), rect.height(), "−∞ dB · 완전 정합", 12, BLUE,
                   align=Qt.AlignmentFlag.AlignCenter)
         if self.stale:
-            _text(p, rect.x(), rect.y()+4, rect.width()-8, 20, "이전 결과 · 입력이 바뀌어 다시 계산 필요", 9, AMBER,
+            _text(p, rect.x(), rect.bottom()-24, rect.width()-8, 20, "이전 결과 · 입력이 바뀌어 다시 계산 필요", 9, AMBER,
                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         footer = "DC · 도선 1가닥" if self.metric_key == "dcr" else f"설계 {frequency_text(s.design_hz)}"
+        if self.marker_hz is None:
+            footer += "   /   그래프를 끌면 마커"
         _text(p, 12, height-25, width-24, 21, f"{axis.title}   /   {footer}", 8.5, MUTED,
               align=Qt.AlignmentFlag.AlignCenter)
 
@@ -605,6 +702,7 @@ class PlotWidget(_DrawingWidget):
         p.fillRect(rect, QColor("#191d23"))
         low, high, yticks = _y_ticks(values)
         axis = _FrequencyAxis(s.freq_hz, self.log_x[self.metric_key])
+        self._plot = (p.worldTransform().mapRect(rect), axis)
         px = lambda f: rect.left() + axis.position(f) * rect.width()
         py = lambda v: rect.bottom() - (v - low) / (high - low) * rect.height()
         for tick in yticks:
@@ -633,20 +731,21 @@ class PlotWidget(_DrawingWidget):
             p.setPen(QPen(QColor(EDITOR), 2))
             p.setBrush(QColor(COPPER))
             p.drawEllipse(QPointF(marker_x, py(design)), 5.5, 5.5)
+        self._draw_marker(p, rect, values, px, py, unit, 12, 5.5)
         p.restore()
         if not np.any(np.isfinite(values)):
             _text(p, rect.x(), rect.y(), rect.width(), rect.height(),
-                  "∞ dB · 완전 정합" if np.all(np.isposinf(values)) else "표시 가능한 유한한 결과 없음",
+                  "−∞ dB · 완전 정합" if np.all(np.isneginf(values)) else "표시 가능한 유한한 결과 없음",
                   19, BLUE, align=Qt.AlignmentFlag.AlignCenter)
         if self.stale:
-            _text(p, rect.x(), rect.y() + 8, rect.width() - 14, 28, "이전 결과 · 입력이 바뀌어 다시 계산 필요",
+            _text(p, rect.x(), rect.bottom() - 36, rect.width() - 14, 28, "이전 결과 · 입력이 바뀌어 다시 계산 필요",
                   12, AMBER, align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         notes = {
             "impedance": "손실 RLGC 모델의 Re(Zc) · 차동 Z = 2 × Zodd · 구리색 점선: 설계 주파수",
             "dcr": "도선 1가닥의 단위 길이 DC 저항 · 주파수에 무관 · 차동 루프는 2가닥 합산",
-            "return": "RL = −20 log₁₀|S₁₁| · 값이 클수록 반사 작음 · 양단 동일 기준 포트",
-            "attenuation": "진행파의 단위 길이 손실 · 도체 및 유전체 손실 포함",
-            "insertion": "IL = −20 log₁₀|S₂₁| · 지정한 길이와 양단 부정합 포함",
+            "s11": "20 log₁₀|S₁₁| · 0 dB에 가까울수록 반사 큼 · 양단 동일 기준 포트 · 차동쌍은 Sdd11",
+            "attenuation": "진행파의 단위 길이 손실 · 도체(표피 효과) 및 유전체 손실 포함",
+            "s21": "20 log₁₀|S₂₁| · 0 dB에 가까울수록 손실 작음 · 지정한 길이와 양단 부정합 포함 · 차동쌍은 Sdd21",
         }
         _text(p, 35, 576, 1030, 27, notes[self.metric_key], 11, MUTED)
 
@@ -660,7 +759,8 @@ def _application():
         _owned_application = QApplication([])
 
 
-def _image(content: Snapshot | Section, metric: str, log_x: bool | None = None) -> QImage:
+def _image(content: Snapshot | Section, metric: str, log_x: bool | None = None,
+           marker_hz: float | None = None) -> QImage:
     _application()
     if metric == "section":
         widget = SectionWidget()
@@ -670,6 +770,7 @@ def _image(content: Snapshot | Section, metric: str, log_x: bool | None = None) 
         widget.set_metric(metric)
         if log_x is not None:
             widget.set_log_x(log_x)
+        widget.set_marker(marker_hz)
         widget.set_snapshot(content)
     image = QImage(1760, 992, QImage.Format.Format_ARGB32)
     p = QPainter(image)
@@ -690,13 +791,15 @@ def _atomic_path(path: str | Path):
     return destination, Path(name)
 
 
-def save_png(path: str | Path, content: Snapshot | Section, metric: str, log_x: bool | None = None):
+def save_png(path: str | Path, content: Snapshot | Section, metric: str, log_x: bool | None = None,
+             marker_hz: float | None = None):
     """Write one graph or the section, preserving an existing file on failure.
 
     metric "section" also accepts a Section, so the drawing can be saved before
     calculating. log_x selects the frequency axis; None uses the metric default.
+    marker_hz draws the movable marker with its readout.
     """
-    image = _image(content, metric, log_x)
+    image = _image(content, metric, log_x, marker_hz)
     destination, temporary = _atomic_path(path)
     try:
         if not image.save(str(temporary), "PNG"):
@@ -713,17 +816,19 @@ def _assumptions(snapshot: Snapshot) -> list[str]:
         "스트립라인의 도선 밖 재료 경계는 구리 두께의 중앙. 마이크로스트립 재료 경계는 구리 하부.",
         "W와 S는 도선 하부 기준. 측벽 각도 90°는 직사각형. 동일층 접지 실드는 바깥 도선에서 G만큼 이격.",
         "차동 Z는 2×Zodd = Vdiff/I. 표시 임피던스는 손실 RLGC 모델의 Re(Zc). DCR은 도선 1가닥 기준.",
-        "RL과 IL은 입력·출력의 동일한 기준 임피던스에 연결한 지정 길이 선로의 양수 손실값.",
-        "구리는 20°C 평활 표면 가정. 고주파 도체 손실은 증분 인덕턴스 법칙. 이상적인 무한 폭 접지의 DC 저항은 0.",
+        "S11과 S21은 입력·출력의 동일한 기준 임피던스에 연결한 지정 길이 선로의 20 log₁₀|S| (0 dB 이하). 차동쌍은 Sdd11·Sdd21.",
+        "구리는 20°C 평활 표면 가정. 도체 저항은 DC에서 표피 효과 영역(√f)으로 이어지며 고주파 극한은 증분 인덕턴스 법칙. 이상적인 무한 폭 접지의 DC 저항은 0.",
         "거칠기·비아·커넥터·굽힘·방사·이방성·고차 모드 제외. 실제 설계는 필드 해석/측정으로 확인할 것.",
     ]
     return [*generic, *(WARNINGS[key][1] for key in getattr(snapshot.result, "warnings", ()) if key in WARNINGS)]
 
 
-def save_pptx(path: str | Path, snapshot: Snapshot, log_x: dict[str, bool] | None = None):
+def save_pptx(path: str | Path, snapshot: Snapshot, log_x: dict[str, bool] | None = None,
+              marker_hz: float | None = None):
     """Export editable conditions/results and the exact Qt figures in a report.
 
     log_x maps a metric key to its frequency axis; missing keys use the defaults.
+    marker_hz adds the movable marker to every graph and to the table of values.
     """
     from pptx import Presentation
     from pptx.dml.color import RGBColor
@@ -841,7 +946,7 @@ def save_pptx(path: str | Path, snapshot: Snapshot, log_x: dict[str, bool] | Non
             label = "단면 구조 - 연결과 치수" if metric == "section" else _title(s, metric)
             item = slide(f"{number:02d} / {label}")
             picture = Path(folder) / f"{metric}.png"
-            save_png(picture, s, metric, log_x.get(metric))
+            save_png(picture, s, metric, log_x.get(metric), marker_hz)
             item.shapes.add_picture(str(picture), Inches(1.55), Inches(1.1), height=Inches(5.78))
 
         item = slide("10 / 수치 결과 - 대표 주파수", "원본 계산점 중 대표값 · 설계 주파수는 별도 보간값")
@@ -850,7 +955,12 @@ def save_pptx(path: str | Path, snapshot: Snapshot, log_x: dict[str, bool] | Non
         for index in indices:
             rows.append([frequency_text(s.freq_hz[index]), *[_number(_values(s, key)[index]) for key in METRICS]])
         rows.append(["설계 " + frequency_text(s.design_hz), *[_number(_at_design(s, _values(s, key))) for key in METRICS]])
-        table(item, ["주파수", "Z (Ω)", "DCR (Ω/m)", "RL (dB)", "전파 손실 (dB/m)", "IL (dB)"], rows, h=4.25)
+        if marker_hz is not None and s.freq_hz[0] <= marker_hz <= s.freq_hz[-1]:
+            rows.append(["마커 " + frequency_text(marker_hz, 4),
+                         *[_number(_at(s, _values(s, key), marker_hz)) for key in METRICS]])
+        pair = g.kind.startswith("coupled_")
+        table(item, ["주파수", "Z (Ω)", "DCR (Ω/m)", "Sdd11 (dB)" if pair else "S11 (dB)", "전파 손실 (dB/m)",
+                     "Sdd21 (dB)" if pair else "S21 (dB)"], rows, h=4.25)
         text(item, .64, 6.15, 12, .45, "DCR: 도선 1가닥 기준. 차동 Z = 2 × Zodd = Vdiff/I.", 15, MUTED)
 
         assumptions = _assumptions(s)
