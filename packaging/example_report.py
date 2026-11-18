@@ -40,8 +40,10 @@ def main(output):
         if window.job is not None or window.dirty or window.snapshot is None:
             raise SystemExit(f"Calculation failed: {window.status.text()}")
         save_pptx(output, window.snapshot, window.plot.log_x)
+        width = window.snapshot.geometry.width_um
         window.close()
-    print(f"{output}: {window.status.text()}")
+    # ASCII only: a build console may not encode the Korean status text.
+    print(f"{output}: synthesized bottom width {width:.3f} um")
 
 
 if __name__ == "__main__":
