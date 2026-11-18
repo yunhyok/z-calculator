@@ -464,7 +464,7 @@ def _linear_ticks(low: float, high: float):
     major = [index * step for index in range(first, last + 1)]
     minor = [(index + .5) * step for index in range(first - 1, last + 1)
              if start < (index + .5) * step < end]
-    return start, end, major, minor
+    return start, end, major, minor, step
 
 
 class _FrequencyAxis:
@@ -479,13 +479,18 @@ class _FrequencyAxis:
             self.labels = [frequency_text(value) for value in self.major]
             self.title = "주파수 (로그 축)"
         else:
-            self.low, self.high, self.major, self.minor = _linear_ticks(low, high)
+            self.low, self.high, self.major, self.minor, step = _linear_ticks(low, high)
             divisor, unit = next(((d, u) for d, u in ((1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz"))
                                   if self.high >= d), (1.0, "Hz"))
-            self.labels = [f"{value / divisor:.6g}" for value in self.major]
+            # Enough decimals to tell neighbouring ticks apart, however narrow the sweep.
+            decimals = max(0, 1 - math.floor(math.log10(step / divisor)))
+            self.labels = [f"{value / divisor:.{decimals}f}".rstrip("0").rstrip(".") if decimals
+                           else f"{value / divisor:.0f}" for value in self.major]
             self.title = f"주파수 ({unit})"
 
     def position(self, frequency: float) -> float:
+        if self.high <= self.low:  # a sweep one rounding step wide
+            return .5
         if self.log:
             return math.log(frequency / self.low) / math.log(self.high / self.low)
         return (frequency - self.low) / (self.high - self.low)

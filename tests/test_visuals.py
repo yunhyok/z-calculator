@@ -64,15 +64,26 @@ class VisualTests(unittest.TestCase):
     def test_linear_frequency_axis_uses_round_ticks(self):
         # A 10 MHz start is within 5% of the span from zero, so the axis starts at zero.
         self.assertEqual(_linear_ticks(1e7, 2e10)[:3], (0, 2e10, [0, 5e9, 1e10, 1.5e10, 2e10]))
+        self.assertEqual(_linear_ticks(1e7, 2e10)[4], 5e9)
         axis = _FrequencyAxis(np.array([1e7, 2e10]), log=False)
         self.assertEqual((axis.labels, axis.title), (["0", "5", "10", "15", "20"], "주파수 (GHz)"))
         self.assertAlmostEqual(axis.position(1e10), 0.5)
         # A start far from a round bound keeps the data range: no empty band left of the curve.
-        start, end, major, _ = _linear_ticks(3.3e8, 9.1e8)
+        start, end, major, _, _ = _linear_ticks(3.3e8, 9.1e8)
         self.assertEqual((start, end), (3.3e8, 9.1e8))
         self.assertTrue(all(start <= tick <= end for tick in major))
         axis = _FrequencyAxis(np.array([3.3e8, 9.1e8]), log=False)
         self.assertEqual((axis.labels, axis.title), (["400", "600", "800"], "주파수 (MHz)"))
+        # Narrow sweeps and 2.5 steps still get distinct labels.
+        narrow = _FrequencyAxis(np.array([1e9, 1.00001e9]), log=False)
+        self.assertEqual(len(set(narrow.labels)), len(narrow.labels))
+        self.assertEqual(narrow.labels[0], "1")
+        self.assertEqual(_FrequencyAxis(np.array([1e9, 1.2e10]), log=False).labels, ["2.5", "5", "7.5", "10", "12.5"])
+        # A sweep one rounding step wide draws instead of dividing by zero.
+        point = _FrequencyAxis(np.array([1e9, np.nextafter(1e9, 2e9)]), log=False)
+        self.assertTrue(0 <= point.position(1e9) <= 1)
+        point.high = point.low
+        self.assertEqual(point.position(1e9), .5)
         log_axis = _FrequencyAxis(np.array([1e6, 1e10]), log=True)
         self.assertAlmostEqual(log_axis.position(1e8), 0.5)
         self.assertEqual(log_axis.labels[0], "1 MHz")

@@ -48,6 +48,14 @@ def receded(g, distance):
     return replace(g, **changes)
 
 
+def incremental_inductance(g):
+    """Wheeler's R/Rs in 1/m from two separately meshed sections, receded and grown."""
+    distance = 0.01 * min(g.top_width_um, *g.active_dimensions().values())
+    inductance = [analyze(receded(g, d), [1e9], 1, 0, 1, 0).quasistatic_impedance_ohm[0] / C0
+                  for d in (-distance, distance)]
+    return (inductance[1] - inductance[0]) / (2 * distance * 1e-6) / MU0
+
+
 def skin_resistance_factor(g):
     """R/Rs in 1/m from the engine, far above the skin-effect crossover."""
     frequency = 1e12
@@ -153,12 +161,21 @@ class EngineTests(unittest.TestCase):
                   Geometry(kind="coupled_stripline", thickness_um=18, gap_um=120,
                            shield=True, clearance_um=150)):
             with self.subTest(g=g):
-                inductance = []
-                for distance in (-0.2, 0.2):
-                    vacuum = analyze(receded(g, distance), [1e9], 1, 0, 1, 0)
-                    inductance.append(vacuum.quasistatic_impedance_ohm[0] / C0)
-                expected = (inductance[1] - inductance[0]) / 0.4e-6 / MU0
-                self.assertLess(abs(skin_resistance_factor(g) / expected - 1), 0.01)
+                self.assertLess(abs(skin_resistance_factor(g) / incremental_inductance(g) - 1), 0.01)
+
+    def test_skin_resistance_with_gaps_far_thinner_than_copper(self):
+        # The receding distance of the derivative must stay small against every gap,
+        # not only against the copper: these sections were up to 100% off otherwise.
+        for g in (Geometry(width_um=200, thickness_um=35, bottom_um=0.1),
+                  Geometry(width_um=3000, thickness_um=2000, bottom_um=1),
+                  Geometry(kind="coupled_microstrip", width_um=60, thickness_um=50, bottom_um=5, gap_um=0.6),
+                  Geometry(kind="stripline", width_um=150, thickness_um=30, bottom_um=0.5, top_um=200,
+                           shield=True, clearance_um=0.4)):
+            with self.subTest(g=g):
+                self.assertLess(abs(skin_resistance_factor(g) / incremental_inductance(g) - 1), 0.01)
+        # Parallel-plate limit: strip and plane each contribute Rs / W.
+        plates = Geometry(width_um=200, thickness_um=35, bottom_um=0.1)
+        self.assertLess(abs(skin_resistance_factor(plates) * plates.width_um * 1e-6 / 2 - 1), 0.02)
 
     def test_stripline_skin_resistance_matches_published_formula(self):
         # D. M. Pozar, Microwave Engineering, 4th ed., sec. 3.7, wide-strip branch

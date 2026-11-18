@@ -230,8 +230,9 @@ class _Section:
         # of the vacuum capacitance. For the discrete minimum-energy potential the
         # derivative equals the energy change at frozen potential (envelope theorem),
         # so it converges like the capacitance itself. A direct surface integral of
-        # E^2 converges only as h^(1/3) at 90 degree corners (9-16% low on this grid).
-        step = 1e-3 * min(t, g.top_width_um)
+        # E^2 converges only as h^(1/3) at 90 degree corners (7-16% low on this grid).
+        # The step stays small against every dimension, including gaps far thinner than the copper.
+        step = 1e-3 * min(g.top_width_um, *g.active_dimensions().values())
         receded, grown = (self._stored(self._nodes(d), potential).sum() for d in (step, -step))
         stored = (bottom + top) / (EPS0 * self.factor)
         surface_factor = 1e6 * (grown - receded) / (2 * step * self.factor * stored ** 2)

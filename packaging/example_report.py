@@ -11,10 +11,13 @@ import sys
 import tempfile
 import time
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+if sys.platform != "win32":
+    # Windows draws with its own platform and fonts; Qt's offscreen platform has no fonts there.
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PySide6.QtCore import QSettings
+from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import QApplication
 
 from zcalc.ui import Window, configure_style
@@ -23,6 +26,8 @@ from zcalc.visuals import save_pptx
 
 def main(output):
     app = QApplication([])
+    if not QFontDatabase.families(QFontDatabase.WritingSystem.Korean):
+        raise SystemExit("No font with Korean glyphs: the figures in the report would be unreadable.")
     configure_style(app)
     with tempfile.TemporaryDirectory() as folder:
         # Keep the user's stored library path and export folder out of the example.
