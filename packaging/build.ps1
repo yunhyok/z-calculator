@@ -108,7 +108,7 @@ print("Frozen source and native-library provenance checks passed.")
 
     & $InnoCompiler /Qp "packaging\installer.iss"
     if ($LASTEXITCODE) { throw "Inno Setup failed." }
-    $installer = Join-Path $projectRoot "dist\Z-Calculator-1.0.0-Windows-x64-Setup.exe"
+    $installer = Join-Path $projectRoot "dist\Z-Calculator-1.1.0-Windows-x64-Setup.exe"
     Get-FileHash -Algorithm SHA256 -LiteralPath $installer
     Write-Host "Installer: $installer"
 }

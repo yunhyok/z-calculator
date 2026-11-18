@@ -22,6 +22,8 @@ EDITOR = "#15181d"
 TEXT = "#eceef1"
 MUTED = "#b9c0ca"
 BLUE = "#8fc1ff"
+STALE = "#5d7694"
+AMBER = "#f0c27a"
 COPPER = "#dfaa70"
 GRID = "#3d444f"
 
@@ -31,13 +33,36 @@ KINDS = {
     "coupled_microstrip": "차동 마이크로스트립",
     "coupled_stripline": "차동 스트립라인",
 }
+# key: (title, unit, Result attribute). The titles are also the graph selector entries.
 METRICS = {
     "impedance": ("특성 임피던스", "Ω", "impedance_ohm"),
-    "dcr": ("직류 저항 · 도체 1개", "Ω/m", "dcr_ohm_m"),
-    "return": ("반사 손실", "dB", "return_loss_db"),
-    "attenuation": ("단위 길이 감쇠", "dB/m", "attenuation_db_m"),
-    "insertion": ("유한 길이 삽입 손실", "dB", "insertion_loss_db"),
+    "dcr": ("단위 길이당 DCR", "Ω/m", "dcr_ohm_m"),
+    "return": ("반사 손실 RL", "dB", "return_loss_db"),
+    "attenuation": ("단위 길이당 전파 손실", "dB/m", "attenuation_db_m"),
+    "insertion": ("지정 길이 삽입 손실 IL", "dB", "insertion_loss_db"),
 }
+# Default frequency axis: S-parameter style losses read best on a linear axis.
+LOG_X = {"impedance": True, "dcr": True, "return": False, "attenuation": False, "insertion": False}
+# engine.WARNINGS key: (status-bar phrase, report sentence)
+WARNINGS = {
+    "wavelength": ("단면이 파장의 1/10 초과 · 전파 해석 검증 필요",
+                   "단면 치수가 파장의 1/10 초과. 고차 모드·전파 해석으로 확인할 것."),
+    "loss_tangent": ("Df > 0.1 · 유전체 손실 근사 정확도 저하",
+                     "유전체 손실은 작은 손실 근사. Df > 0.1에서는 정확도 저하."),
+    "aspect_ratio": ("단면 치수비 100:1 초과 · 독립 해석 검증 필요",
+                     "단면 치수비가 100:1 초과. 격자 정확도를 독립 해석으로 확인할 것."),
+}
+
+
+@dataclass
+class Section:
+    """What the section drawing shows; available before any calculation."""
+    geometry: Any
+    bottom_name: str
+    top_name: str
+    bottom_er: float | None = None  # Dk at the design frequency, None if not entered yet
+    top_er: float | None = None
+    width_known: bool = True  # False while the width still has to be synthesized
 
 
 @dataclass
@@ -78,6 +103,11 @@ class Snapshot:
                 raise ValueError(f"{key}: 주파수별 유한한 재료 데이터가 필요합니다.")
             setattr(self, key, values)
 
+    @property
+    def section(self) -> Section:
+        return Section(self.geometry, self.bottom_name, self.top_name,
+                       _at_design(self, self.bottom_er), _at_design(self, self.top_er))
+
 
 def frequency_text(value: float) -> str:
     for divisor, unit in ((1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz")):
@@ -112,6 +142,12 @@ def _values(snapshot: Snapshot, metric: str) -> np.ndarray:
 
 def _at_design(snapshot: Snapshot, values: np.ndarray) -> float:
     return float(np.interp(math.log10(snapshot.design_hz), np.log10(snapshot.freq_hz), values))
+
+
+def _title(snapshot: Snapshot, metric: str) -> str:
+    if metric == "impedance":
+        return "차동 임피던스 Re(Zc)" if snapshot.geometry.kind.startswith("coupled_") else "특성 임피던스 Re(Zc)"
+    return METRICS[metric][0]
 
 
 def _font(size: float, bold: bool = False) -> QFont:
@@ -154,17 +190,19 @@ def _dimension(p: QPainter, x1, y1, x2, y2, label: str, *, vertical=False):
 
 
 class _DrawingWidget(QWidget):
+    placeholder = ""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.snapshot: Snapshot | None = None
+        self.content = None
         self.setMinimumSize(300, 190)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def sizeHint(self):
         return QSize(1000, 564)
 
-    def set_snapshot(self, snapshot: Snapshot | None):
-        self.snapshot = snapshot
+    def set_content(self, content):
+        self.content = content
         self.update()
 
     def paintEvent(self, event):
@@ -175,31 +213,44 @@ class _DrawingWidget(QWidget):
     def draw(self, p: QPainter, width: float, height: float):
         p.fillRect(QRectF(0, 0, width, height), QColor(EDITOR))
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        if self.snapshot is not None and height < 460:
-            self._draw_compact(p, width, height)
-            return
-        scale = min(width / 1100, height / 620)
-        p.translate((width - 1100 * scale) / 2, (height - 620 * scale) / 2)
-        p.scale(scale, scale)
-        if self.snapshot is None:
-            _text(p, 80, 260, 940, 70, "조건을 입력하고 계산할 것.", 20, MUTED,
+        if self.content is None:
+            _text(p, 12, 0, width - 24, height, self.placeholder, 11, MUTED,
                   align=Qt.AlignmentFlag.AlignCenter)
+        elif height < 460:
+            self._draw_compact(p, width, height)
         else:
+            scale = min(width / 1100, height / 620)
+            p.translate((width - 1100 * scale) / 2, (height - 620 * scale) / 2)
+            p.scale(scale, scale)
             self._draw(p)
+
+
+def _material_label(side: str, name: str, er: float | None) -> str:
+    return f"{side} {name}" + ("" if er is None else f" · Dk {_number(er)}")
 
 
 class SectionWidget(_DrawingWidget):
     """Dimensioned conceptual section. Display axes are independently scaled."""
 
+    placeholder = "단면 치수를 입력하면 개념도가 표시됩니다."
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAccessibleName("전송선 단면도")
 
+    def set_section(self, section: Section | None):
+        self.set_content(section)
+
+    @property
+    def section(self) -> Section | None:
+        return self.content
+
     def _draw_compact(self, p: QPainter, width: float, height: float):
-        s, g = self.snapshot, self.snapshot.geometry
+        s, g = self.content, self.content.geometry
         coupled = g.kind.startswith("coupled_")
         stripline = "microstrip" not in g.kind
-        _text(p, 12, 5, width - 24, 26, KINDS[g.kind] + " / 단면 개념도", 11, bold=True)
+        width_text = f"W {g.width_um:g}" if s.width_known else "W 역산"
+        _text(p, 12, 5, width - 24, 26, KINDS[g.kind] + " · 단면 개념도", 11, bold=True)
         left, right, top, bottom = 79, width - 20, 57, height - 64
         height_fraction = np.clip(g.top_um / (g.top_um + g.bottom_um), .35, .65) if stripline else .44
         trace_top = top + (bottom - top - 11) * height_fraction
@@ -210,7 +261,7 @@ class SectionWidget(_DrawingWidget):
         sx = (right-left)*.7 / extent
         total = (2*g.width_um + g.gap_um if coupled else g.width_um)*sx
         start, bw = (left+right-total)/2, g.width_um*sx
-        inset = g.thickness_um / math.tan(math.radians(g.angle_deg))*sx
+        inset = min(g.thickness_um / math.tan(math.radians(g.angle_deg))*sx, bw/2)
         p.fillRect(QRectF(left, top, right-left, bottom-top), QColor("#293848"))
         interface = (trace_top + trace_bottom)/2 if stripline else trace_bottom
         p.fillRect(QRectF(left, interface, right-left, bottom-interface), QColor("#344150"))
@@ -233,11 +284,12 @@ class SectionWidget(_DrawingWidget):
                 _text(p, x-4, trace_top-20, end-x+8, 18, "GND", 8, MUTED,
                       align=Qt.AlignmentFlag.AlignCenter)
         _text(p, left+5, top-24, right-left-65, 21,
-              f"상부 {s.top_name}" if stripline else "상부 공기", 9, MUTED)
+              _material_label("상부", s.top_name, s.top_er) if stripline else "상부 공기 · Dk 1", 9, MUTED)
         if stripline:
             _text(p, right-55, top-24, 55, 21, "GND", 8, MUTED,
                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        _text(p, left+5, bottom+8, right-left-65, 20, f"하부 {s.bottom_name}", 9, MUTED)
+        _text(p, left+5, bottom+8, right-left-65, 20,
+              _material_label("하부", s.bottom_name, s.bottom_er), 9, MUTED)
         _text(p, right-55, bottom+8, 55, 20, "GND", 8, MUTED,
               align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         # Short leader lines preserve the dimension sketch even at 550 × 210.
@@ -252,33 +304,38 @@ class SectionWidget(_DrawingWidget):
         _line(p, start, dimension_y, start+bw, dimension_y, BLUE)
         for x in (start, start+bw):
             _line(p, x, trace_bottom+3, x, dimension_y+3, BLUE)
-        _text(p, start-32, dimension_y+1, bw+64, 17, f"w {g.width_um:g}", 8, BLUE,
+        _text(p, start-32, dimension_y+1, bw+64, 17, width_text, 8, BLUE,
               align=Qt.AlignmentFlag.AlignCenter)
+        spans = []
         if coupled:
-            gap_x = positions[0]+bw
-            _line(p, gap_x, trace_top-5, positions[1], trace_top-5, BLUE)
-            for x in (gap_x, positions[1]):
+            spans.append((positions[0]+bw, positions[1], f"S {g.gap_um:g}"))
+        if g.shield:
+            edge = positions[-1]+bw
+            spans.append((edge, edge+g.clearance_um*sx, f"G {g.clearance_um:g}"))
+        for x1, x2, text in spans:
+            _line(p, x1, trace_top-5, x2, trace_top-5, BLUE)
+            for x in (x1, x2):
                 _line(p, x, trace_top-8, x, trace_top-2, BLUE)
-            _text(p, gap_x-30, trace_top-24, positions[1]-gap_x+60, 17,
-                  f"s {g.gap_um:g}", 8, BLUE, align=Qt.AlignmentFlag.AlignCenter)
-        _text(p, 3, trace_bottom, 60, max(20, bottom-trace_bottom), f"h₁ {g.bottom_um:g}", 9, BLUE,
+            _text(p, x1-30, trace_top-24, x2-x1+60, 17, text, 8, BLUE,
+                  align=Qt.AlignmentFlag.AlignCenter)
+        _text(p, 3, trace_bottom, 60, max(20, bottom-trace_bottom), f"H₁ {g.bottom_um:g}", 9, BLUE,
               align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if stripline:
-            _text(p, 3, top-4, 60, max(20, trace_top-top), f"h₂ {g.top_um:g}", 9, BLUE,
+            _text(p, 3, top-4, 60, max(20, trace_top-top), f"H₂ {g.top_um:g}", 9, BLUE,
                   align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        summary = f"w {g.width_um:g}   t {g.thickness_um:g}   θ {g.angle_deg:g}°"
+        summary = f"{width_text}   T {g.thickness_um:g}   θ {g.angle_deg:g}°"
         if coupled:
-            summary += f"   s {g.gap_um:g}"
+            summary += f"   S {g.gap_um:g}"
         if g.shield:
-            summary += f"   c {g.clearance_um:g}"
-        _text(p, 12, height-31, width-24, 24, summary + "  µm · 축척 다름", 9, COPPER)
+            summary += f"   G {g.clearance_um:g}"
+        _text(p, 12, height-31, width-24, 24, summary + "   µm · 가로/세로 축척 다름", 9, COPPER)
 
     def _draw(self, p: QPainter):
-        s, g = self.snapshot, self.snapshot.geometry
+        s, g = self.content, self.content.geometry
         coupled = g.kind.startswith("coupled_")
         stripline = g.kind.endswith("stripline") and not g.kind.endswith("microstrip")
         top_width = g.width_um - 2 * g.thickness_um / math.tan(math.radians(g.angle_deg))
-        _text(p, 35, 20, 1000, 42, KINDS[g.kind] + " / 단면 구조", 23, bold=True)
+        _text(p, 35, 20, 1000, 42, KINDS[g.kind] + " · 단면 구조", 23, bold=True)
         _text(p, 35, 65, 1000, 28, "치수 단위 µm · 개념도 · 가로/세로 축척 다름", 11, MUTED)
         # Independent display scales keep thin copper visible; dimensions remain physical values.
         extent = (2 * g.width_um + g.gap_um if coupled else g.width_um)
@@ -300,13 +357,10 @@ class SectionWidget(_DrawingWidget):
         if stripline:
             p.fillRect(QRectF(left, upper_y - 14, right - left, 14), QColor("#79899a"))
             _text(p, 235, upper_y - 42, 680, 24, "상부 접지면 (GND)", 11, MUTED)
+            _text(p, 240, 177, 740, 28, _material_label("상부 유전체:", s.top_name, s.top_er), 12)
         else:
-            _text(p, 240, 155, 650, 28, "상부: 공기 (εr = 1)", 12, MUTED)
-        er = _at_design(s, s.bottom_er)
-        _text(p, 240, 394, 700, 28, f"하부 유전체: {s.bottom_name}   εr = {_number(er)}", 12)
-        if stripline:
-            _text(p, 240, 177, 740, 28,
-                  f"상부 유전체: {s.top_name}   εr = {_number(_at_design(s, s.top_er))}", 12)
+            _text(p, 240, 155, 650, 28, "상부: 공기 · Dk 1", 12, MUTED)
+        _text(p, 240, 394, 700, 28, _material_label("하부 유전체:", s.bottom_name, s.bottom_er), 12)
         total_trace = (2 * g.width_um + g.gap_um if coupled else g.width_um) * sx
         start = (left + right - total_trace) / 2
         bottom_width, upper_width = g.width_um * sx, max(0, top_width * sx)
@@ -323,15 +377,15 @@ class SectionWidget(_DrawingWidget):
                   ("신호 +" if i == 0 else "신호 −") if coupled else "신호 도체", 11, COPPER,
                   align=Qt.AlignmentFlag.AlignCenter)
         _dimension(p, positions[0], 347, positions[0] + bottom_width, 347,
-                   f"w(하부) = {g.width_um:g}")
+                   f"W(하부) = {g.width_um:g}" if s.width_known else "W(하부) = 역산 예정")
         if coupled:
             inner = positions[0] + bottom_width
-            _dimension(p, inner, 215, positions[1], 215, f"s = {g.gap_um:g}")
+            _dimension(p, inner, 215, positions[1], 215, f"S = {g.gap_um:g}")
         _dimension(p, 203, conductor_y + thickness, 203, bottom_y,
-                   f"h₁ = {g.bottom_um:g}", vertical=True)
+                   f"H₁ = {g.bottom_um:g}", vertical=True)
         if stripline:
             _dimension(p, 203, upper_y, 203, conductor_y,
-                       f"h₂ = {g.top_um:g}", vertical=True)
+                       f"H₂ = {g.top_um:g}", vertical=True)
         if g.shield:
             shield_w = .35 * g.width_um * sx
             clearance = g.clearance_um * sx
@@ -343,14 +397,15 @@ class SectionWidget(_DrawingWidget):
                 _text(p, x, conductor_y - 36, end - x, 25, "GND", 11, MUTED,
                       align=Qt.AlignmentFlag.AlignCenter)
             _dimension(p, shield_xs[1] - clearance, 347, shield_xs[1], 347,
-                       f"c = {g.clearance_um:g}")
+                       f"G = {g.clearance_um:g}")
         _line(p, 35, 510, 1065, 510, GRID)
         _text(p, 35, 520, 1030, 28,
-              f"두께 t = {g.thickness_um:g} µm     측벽각 θ = {g.angle_deg:g}°     상부 폭 = {top_width:.3g} µm",
+              f"두께 T = {g.thickness_um:g} µm     측벽 각도 θ = {g.angle_deg:g}°     "
+              + (f"상부 폭 = {top_width:.3g} µm" if s.width_known else "상부 폭 = 역산 예정"),
               12, COPPER)
-        description = "s: 두 도체의 하부 가장자리 간격" if coupled else "w: 도체의 하부 폭"
+        description = "S: 두 도선의 하부 가장자리 간격" if coupled else "W: 도선의 하부 선폭"
         if g.shield:
-            description += "     c: 바깥 도체 하부 가장자리~동일 층 접지 간격"
+            description += "     G: 바깥 도선 하부 가장자리~동일층 접지 실드 간격"
         _text(p, 35, 559, 1030, 28, description, 11, MUTED)
 
 
@@ -394,11 +449,60 @@ def _x_ticks(low: float, high: float):
     return separated, minor
 
 
+def _linear_ticks(low: float, high: float):
+    """Round ticks for a linear axis; it grows to a round bound within 5% of the span."""
+    span = high - low
+    raw = span / 5
+    power = 10 ** math.floor(math.log10(raw))
+    step = next(x for x in (1, 2, 2.5, 5, 10) if x * power >= raw) * power
+    start, end = math.floor(low / step + 1e-9) * step, math.ceil(high / step - 1e-9) * step
+    if low - start > .05 * span:
+        start = low
+    if end - high > .05 * span:
+        end = high
+    first, last = math.ceil(start / step - 1e-9), math.floor(end / step + 1e-9)
+    major = [index * step for index in range(first, last + 1)]
+    minor = [(index + .5) * step for index in range(first - 1, last + 1)
+             if start < (index + .5) * step < end]
+    return start, end, major, minor
+
+
+class _FrequencyAxis:
+    """Maps frequency to 0…1 across the plot and supplies tick positions and labels."""
+
+    def __init__(self, freq_hz: np.ndarray, log: bool):
+        self.log = log
+        low, high = float(freq_hz[0]), float(freq_hz[-1])
+        if log:
+            self.low, self.high = low, high
+            self.major, self.minor = _x_ticks(low, high)
+            self.labels = [frequency_text(value) for value in self.major]
+            self.title = "주파수 (로그 축)"
+        else:
+            self.low, self.high, self.major, self.minor = _linear_ticks(low, high)
+            divisor, unit = next(((d, u) for d, u in ((1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz"))
+                                  if self.high >= d), (1.0, "Hz"))
+            self.labels = [f"{value / divisor:.6g}" for value in self.major]
+            self.title = f"주파수 ({unit})"
+
+    def position(self, frequency: float) -> float:
+        if self.log:
+            return math.log(frequency / self.low) / math.log(self.high / self.low)
+        return (frequency - self.low) / (self.high - self.low)
+
+
 class PlotWidget(_DrawingWidget):
+    placeholder = "계산을 실행하면 주파수 응답이 표시됩니다."
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.metric_key = "impedance"
+        self.log_x = dict(LOG_X)
+        self.stale = False
         self.setAccessibleName("주파수별 전송선 그래프")
+
+    def set_snapshot(self, snapshot: Snapshot | None):
+        self.set_content(snapshot)
 
     def set_metric(self, key: str):
         if key not in METRICS:
@@ -406,104 +510,18 @@ class PlotWidget(_DrawingWidget):
         self.metric_key = key
         self.update()
 
-    def _draw_compact(self, p: QPainter, width: float, height: float):
-        s = self.snapshot
-        title, unit, _ = METRICS[self.metric_key]
-        if self.metric_key == "impedance" and s.geometry.kind.startswith("coupled_"):
-            title = "차동 임피던스 Re(Zc)"
-        elif self.metric_key == "impedance":
-            title += " Re(Zc)"
-        values = _values(s, self.metric_key)
-        design = _at_design(s, values)
-        _text(p, 12, 3, width*.62-12, 28, title, 11, bold=True)
-        _text(p, width*.62, 3, width*.38-12, 28, f"{_number(design)} {unit}", 12, BLUE, True,
-              align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        rect = QRectF(72, 49, width-95, height-104)
-        low, high, ticks = _y_ticks(values)
-        px = lambda f: rect.left() + math.log(f/s.freq_hz[0])/math.log(s.freq_hz[-1]/s.freq_hz[0])*rect.width()
-        py = lambda value: rect.bottom() - (value-low)/(high-low)*rect.height()
-        # A short plot keeps three horizontal labels at a readable fixed font size.
-        step = max(1, math.ceil((len(ticks)-1)/3))
-        for value in ticks[::step]:
-            y = py(value)
-            _line(p, rect.left(), y, rect.right(), y, GRID)
-            _text(p, 3, y-10, 60, 20, _number(value), 8.5, MUTED,
-                  align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        major, _ = _x_ticks(s.freq_hz[0], s.freq_hz[-1])
-        major = major[::max(1, math.ceil(len(major)/max(3, int(width/110))))]
-        for f in major:
-            x = px(f)
-            _line(p, x, rect.top(), x, rect.bottom(), GRID)
-            _text(p, x-43, rect.bottom()+5, 86, 20, frequency_text(f), 8, MUTED,
-                  align=Qt.AlignmentFlag.AlignCenter)
-        _text(p, 8, 29, 58, 20, unit, 8.5, MUTED)
-        p.save()
-        p.setClipRect(rect.adjusted(-1, -1, 1, 1))
-        path, active = QPainterPath(), False
-        for f, value in zip(s.freq_hz, values):
-            if not np.isfinite(value):
-                active = False
-                continue
-            point = QPointF(px(f), py(value))
-            if active:
-                path.lineTo(point)
-            else:
-                path.moveTo(point)
-            active = True
-        p.setPen(QPen(QColor(BLUE), 2))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(path)
-        x = px(s.design_hz)
-        _line(p, x, rect.top(), x, rect.bottom(), COPPER, 1.1, True)
-        if np.isfinite(design):
-            p.setBrush(QColor(COPPER))
-            p.drawEllipse(QPointF(x, py(design)), 3.5, 3.5)
-        p.restore()
-        if not np.any(np.isfinite(values)):
-            _text(p, rect.x(), rect.y(), rect.width(), rect.height(), "∞ dB · 완전 정합", 12, BLUE,
-                  align=Qt.AlignmentFlag.AlignCenter)
-        footer = "DC · 도체 1개" if self.metric_key == "dcr" else f"설계 {frequency_text(s.design_hz)}"
-        _text(p, 12, height-25, width-24, 21, f"로그 주파수   /   {footer}", 8.5, MUTED,
-              align=Qt.AlignmentFlag.AlignCenter)
+    def set_log_x(self, log: bool):
+        """Choose the frequency axis of the current metric; each metric remembers its own."""
+        self.log_x[self.metric_key] = bool(log)
+        self.update()
 
-    def _draw(self, p: QPainter):
-        s = self.snapshot
-        title, unit, _ = METRICS[self.metric_key]
-        values = _values(s, self.metric_key)
-        design = _at_design(s, values)
-        if self.metric_key == "impedance" and s.geometry.kind.startswith("coupled_"):
-            title = "차동 특성 임피던스"
-        _text(p, 35, 18, 720, 43, title, 23, bold=True)
-        _text(p, 755, 19, 310, 43, f"{_number(design)} {unit}", 23, BLUE, True,
-              align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        _text(p, 35, 65, 1030, 28,
-              f"{KINDS[s.geometry.kind]}   ·   설계 {frequency_text(s.design_hz)}   ·   길이 {s.length_m * 1000:g} mm   ·   기준 {s.reference_ohm:g} Ω",
-              11, MUTED)
-        rect = QRectF(112, 133, 918, 355)
-        p.fillRect(rect, QColor("#191d23"))
-        low, high, yticks = _y_ticks(values)
-        logf = np.log10(s.freq_hz)
-        x0, x1 = float(logf[0]), float(logf[-1])
-        px = lambda f: rect.left() + (math.log10(f) - x0) / (x1 - x0) * rect.width()
-        py = lambda v: rect.bottom() - (v - low) / (high - low) * rect.height()
-        for tick in yticks:
-            y = py(tick)
-            _line(p, rect.left(), y, rect.right(), y, GRID)
-            _text(p, 8, y - 12, 91, 24, _number(tick), 10, MUTED,
-                  align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        major, minor = _x_ticks(s.freq_hz[0], s.freq_hz[-1])
-        for value in minor:
-            _line(p, px(value), rect.top(), px(value), rect.bottom(), "#2d333d", .8, True)
-        for value in major:
-            x = px(value)
-            _line(p, x, rect.top(), x, rect.bottom(), GRID)
-            _text(p, x - 70, rect.bottom() + 10, 140, 26, frequency_text(value), 10, MUTED,
-                  align=Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
-        _text(p, 25, 100, 100, 24, unit, 11, MUTED)
-        _text(p, 380, 533, 420, 26, "주파수 (로그 축)", 12, MUTED,
-              align=Qt.AlignmentFlag.AlignCenter)
-        p.save()
-        p.setClipRect(rect.adjusted(-1, -1, 1, 1))
+    def set_stale(self, stale: bool):
+        """Mark the curve as belonging to inputs that have since changed."""
+        if stale != self.stale:
+            self.stale = stale
+            self.update()
+
+    def _curve(self, s: Snapshot, values: np.ndarray, px, py) -> QPainterPath:
         path, open_path = QPainterPath(), False
         for frequency, value in zip(s.freq_hz, values):
             if not np.isfinite(value):
@@ -515,9 +533,95 @@ class PlotWidget(_DrawingWidget):
             else:
                 path.moveTo(point)
                 open_path = True
-        p.setPen(QPen(QColor(BLUE), 2.8))
+        return path
+
+    def _draw_compact(self, p: QPainter, width: float, height: float):
+        s = self.content
+        unit = METRICS[self.metric_key][1]
+        values = _values(s, self.metric_key)
+        design = _at_design(s, values)
+        accent = STALE if self.stale else BLUE
+        _text(p, 12, 3, width*.62-12, 28, _title(s, self.metric_key), 11, bold=True)
+        _text(p, width*.62, 3, width*.38-12, 28, f"{_number(design)} {unit}", 12, accent, True,
+              align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        rect = QRectF(72, 49, width-95, height-104)
+        low, high, ticks = _y_ticks(values)
+        axis = _FrequencyAxis(s.freq_hz, self.log_x[self.metric_key])
+        px = lambda f: rect.left() + axis.position(f)*rect.width()
+        py = lambda value: rect.bottom() - (value-low)/(high-low)*rect.height()
+        # A short plot keeps three horizontal labels at a readable fixed font size.
+        step = max(1, math.ceil((len(ticks)-1)/3))
+        for value in ticks[::step]:
+            y = py(value)
+            _line(p, rect.left(), y, rect.right(), y, GRID)
+            _text(p, 3, y-10, 60, 20, _number(value), 8.5, MUTED,
+                  align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        every = max(1, math.ceil(len(axis.major)/max(3, int(width/110))))
+        for f, text in list(zip(axis.major, axis.labels))[::every]:
+            x = px(f)
+            _line(p, x, rect.top(), x, rect.bottom(), GRID)
+            _text(p, x-43, rect.bottom()+5, 86, 20, text, 8, MUTED,
+                  align=Qt.AlignmentFlag.AlignCenter)
+        _text(p, 8, 29, 58, 20, unit, 8.5, MUTED)
+        p.save()
+        p.setClipRect(rect.adjusted(-1, -1, 1, 1))
+        p.setPen(QPen(QColor(accent), 2))
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(path)
+        p.drawPath(self._curve(s, values, px, py))
+        x = px(s.design_hz)
+        _line(p, x, rect.top(), x, rect.bottom(), COPPER, 1.1, True)
+        if np.isfinite(design):
+            p.setBrush(QColor(COPPER))
+            p.drawEllipse(QPointF(x, py(design)), 3.5, 3.5)
+        p.restore()
+        if not np.any(np.isfinite(values)):
+            _text(p, rect.x(), rect.y(), rect.width(), rect.height(), "∞ dB · 완전 정합", 12, BLUE,
+                  align=Qt.AlignmentFlag.AlignCenter)
+        if self.stale:
+            _text(p, rect.x(), rect.y()+4, rect.width()-8, 20, "이전 결과 · 입력이 바뀌어 다시 계산 필요", 9, AMBER,
+                  align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        footer = "DC · 도선 1가닥" if self.metric_key == "dcr" else f"설계 {frequency_text(s.design_hz)}"
+        _text(p, 12, height-25, width-24, 21, f"{axis.title}   /   {footer}", 8.5, MUTED,
+              align=Qt.AlignmentFlag.AlignCenter)
+
+    def _draw(self, p: QPainter):
+        s = self.content
+        unit = METRICS[self.metric_key][1]
+        values = _values(s, self.metric_key)
+        design = _at_design(s, values)
+        accent = STALE if self.stale else BLUE
+        _text(p, 35, 18, 720, 43, _title(s, self.metric_key), 23, bold=True)
+        _text(p, 755, 19, 310, 43, f"{_number(design)} {unit}", 23, accent, True,
+              align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        _text(p, 35, 65, 1030, 28,
+              f"{KINDS[s.geometry.kind]}   ·   설계 {frequency_text(s.design_hz)}   ·   길이 {s.length_m * 1000:g} mm   ·   기준 {s.reference_ohm:g} Ω",
+              11, MUTED)
+        rect = QRectF(112, 133, 918, 355)
+        p.fillRect(rect, QColor("#191d23"))
+        low, high, yticks = _y_ticks(values)
+        axis = _FrequencyAxis(s.freq_hz, self.log_x[self.metric_key])
+        px = lambda f: rect.left() + axis.position(f) * rect.width()
+        py = lambda v: rect.bottom() - (v - low) / (high - low) * rect.height()
+        for tick in yticks:
+            y = py(tick)
+            _line(p, rect.left(), y, rect.right(), y, GRID)
+            _text(p, 8, y - 12, 91, 24, _number(tick), 10, MUTED,
+                  align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        for value in axis.minor:
+            _line(p, px(value), rect.top(), px(value), rect.bottom(), "#2d333d", .8, True)
+        for value, text in zip(axis.major, axis.labels):
+            x = px(value)
+            _line(p, x, rect.top(), x, rect.bottom(), GRID)
+            _text(p, x - 70, rect.bottom() + 10, 140, 26, text, 10, MUTED,
+                  align=Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+        _text(p, 25, 100, 100, 24, unit, 11, MUTED)
+        _text(p, 380, 533, 420, 26, axis.title, 12, MUTED,
+              align=Qt.AlignmentFlag.AlignCenter)
+        p.save()
+        p.setClipRect(rect.adjusted(-1, -1, 1, 1))
+        p.setPen(QPen(QColor(accent), 2.8))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(self._curve(s, values, px, py))
         marker_x = px(s.design_hz)
         _line(p, marker_x, rect.top(), marker_x, rect.bottom(), COPPER, 1.4, True)
         if np.isfinite(design):
@@ -529,12 +633,15 @@ class PlotWidget(_DrawingWidget):
             _text(p, rect.x(), rect.y(), rect.width(), rect.height(),
                   "∞ dB · 완전 정합" if np.all(np.isposinf(values)) else "표시 가능한 유한한 결과 없음",
                   19, BLUE, align=Qt.AlignmentFlag.AlignCenter)
+        if self.stale:
+            _text(p, rect.x(), rect.y() + 8, rect.width() - 14, 28, "이전 결과 · 입력이 바뀌어 다시 계산 필요",
+                  12, AMBER, align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         notes = {
             "impedance": "손실 RLGC 모델의 Re(Zc) · 차동 Z = 2 × Zodd · 구리색 점선: 설계 주파수",
-            "dcr": "도체 1개의 단위 길이 DC 저항 · 주파수에 무관 · 차동 루프는 도체 2개 합산",
-            "return": "RL = −20 log₁₀|S₁₁| · 값이 클수록 반사 작음 · 양 끝 동일 기준 포트",
+            "dcr": "도선 1가닥의 단위 길이 DC 저항 · 주파수에 무관 · 차동 루프는 2가닥 합산",
+            "return": "RL = −20 log₁₀|S₁₁| · 값이 클수록 반사 작음 · 양단 동일 기준 포트",
             "attenuation": "진행파의 단위 길이 손실 · 도체 및 유전체 손실 포함",
-            "insertion": "IL = −20 log₁₀|S₂₁| · 실제 길이와 양 끝 부정합 포함",
+            "insertion": "IL = −20 log₁₀|S₂₁| · 지정한 길이와 양단 부정합 포함",
         }
         _text(p, 35, 576, 1030, 27, notes[self.metric_key], 11, MUTED)
 
@@ -548,12 +655,17 @@ def _application():
         _owned_application = QApplication([])
 
 
-def _image(snapshot: Snapshot, metric: str) -> QImage:
+def _image(content: Snapshot | Section, metric: str, log_x: bool | None = None) -> QImage:
     _application()
-    widget = SectionWidget() if metric == "section" else PlotWidget()
-    if metric != "section":
+    if metric == "section":
+        widget = SectionWidget()
+        widget.set_section(content.section if isinstance(content, Snapshot) else content)
+    else:
+        widget = PlotWidget()
         widget.set_metric(metric)
-    widget.set_snapshot(snapshot)
+        if log_x is not None:
+            widget.set_log_x(log_x)
+        widget.set_snapshot(content)
     image = QImage(1760, 992, QImage.Format.Format_ARGB32)
     p = QPainter(image)
     try:
@@ -573,9 +685,13 @@ def _atomic_path(path: str | Path):
     return destination, Path(name)
 
 
-def save_png(path: str | Path, snapshot: Snapshot, metric: str):
-    """Write one graph or the section, preserving an existing file on failure."""
-    image = _image(snapshot, metric)
+def save_png(path: str | Path, content: Snapshot | Section, metric: str, log_x: bool | None = None):
+    """Write one graph or the section, preserving an existing file on failure.
+
+    metric "section" also accepts a Section, so the drawing can be saved before
+    calculating. log_x selects the frequency axis; None uses the metric default.
+    """
+    image = _image(content, metric, log_x)
     destination, temporary = _atomic_path(path)
     try:
         if not image.save(str(temporary), "PNG"):
@@ -586,39 +702,24 @@ def save_png(path: str | Path, snapshot: Snapshot, metric: str):
 
 
 def _assumptions(snapshot: Snapshot) -> list[str]:
-    supplied = getattr(snapshot.result, "assumptions", None)
     generic = [
         "균일한 직선 전송선의 준정적 단면 근사. 단면도는 치수 설명용이며 가로/세로 축척 다름.",
         "마이크로스트립 상부는 공기. 스트립라인은 위·아래 유전체와 두 접지면 적용.",
-        "스트립라인의 도체 밖 재료 경계는 동박 두께의 중앙. 마이크로스트립 재료 경계는 동박 하부.",
-        "w와 s는 도체 하부 기준. 측벽각 90°는 직사각형. 동일 층 접지는 바깥 도체에서 c만큼 이격.",
-        "차동 Z는 2×Zodd = Vdiff/I. 표시 임피던스는 손실 RLGC 모델의 Re(Zc). DCR은 도체 1개 기준.",
-        "RL과 IL은 입력·출력의 동일한 기준 임피던스에 연결한 유한 길이 선로의 양수 손실값.",
-        "구리는 20°C 평활 표면 가정. 이상적인 무한 폭 접지의 DC 저항은 0. 차동 루프 DCR은 2배.",
+        "스트립라인의 도선 밖 재료 경계는 구리 두께의 중앙. 마이크로스트립 재료 경계는 구리 하부.",
+        "W와 S는 도선 하부 기준. 측벽 각도 90°는 직사각형. 동일층 접지 실드는 바깥 도선에서 G만큼 이격.",
+        "차동 Z는 2×Zodd = Vdiff/I. 표시 임피던스는 손실 RLGC 모델의 Re(Zc). DCR은 도선 1가닥 기준.",
+        "RL과 IL은 입력·출력의 동일한 기준 임피던스에 연결한 지정 길이 선로의 양수 손실값.",
+        "구리는 20°C 평활 표면 가정. 고주파 도체 손실은 증분 인덕턴스 법칙. 이상적인 무한 폭 접지의 DC 저항은 0.",
         "거칠기·비아·커넥터·굽힘·방사·이방성·고차 모드 제외. 실제 설계는 필드 해석/측정으로 확인할 것.",
     ]
-    warning_translations = {
-        "Cross-section exceeds one tenth wavelength; higher-order/full-wave validation required.":
-            "단면 치수가 파장의 1/10 초과. 고차 모드·전파 해석으로 확인할 것.",
-        "Dielectric loss uses a small-loss perturbation; tan(delta)>0.1 reduces accuracy.":
-            "유전체 손실은 작은 손실 근사. Df > 0.1에서는 정확도 저하.",
-    }
-    already_stated = {
-        "2D quasi-TEM estimate; smooth copper at 20 C; no roughness, vias or radiation.",
-        "DC resistance is per signal conductor; ideal infinite return planes/rails have zero DC resistance.",
-        "Exposed microstrip: all top-layer inputs are ignored; upper medium is air.",
-    }
-    warnings = [warning_translations.get(message, message)
-                for message in getattr(snapshot.result, "warnings", ())
-                if message not in already_stated]
-    if supplied:
-        supplied = [supplied] if isinstance(supplied, str) else list(supplied)
-        return list(dict.fromkeys([*supplied, *generic, *warnings]))
-    return [*generic, *warnings]
+    return [*generic, *(WARNINGS[key][1] for key in getattr(snapshot.result, "warnings", ()) if key in WARNINGS)]
 
 
-def save_pptx(path: str | Path, snapshot: Snapshot):
-    """Export editable conditions/results and the exact Qt figures in a report."""
+def save_pptx(path: str | Path, snapshot: Snapshot, log_x: dict[str, bool] | None = None):
+    """Export editable conditions/results and the exact Qt figures in a report.
+
+    log_x maps a metric key to its frequency axis; missing keys use the defaults.
+    """
     from pptx import Presentation
     from pptx.dml.color import RGBColor
     from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
@@ -626,6 +727,7 @@ def save_pptx(path: str | Path, snapshot: Snapshot):
     from pptx.util import Inches, Pt
 
     s, g = snapshot, snapshot.geometry
+    log_x = {**LOG_X, **(log_x or {})}
     prs = Presentation()
     prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
     prs.core_properties.title = "Z Calculator 전송선 계산 보고서"
@@ -693,9 +795,8 @@ def save_pptx(path: str | Path, snapshot: Snapshot):
         return tbl
 
     def metric_row(key):
-        label, unit, _ = METRICS[key]
         vals = _values(s, key)
-        return [label, f"{_number(_at_design(s, vals))} {unit}"]
+        return [_title(s, key), f"{_number(_at_design(s, vals))} {METRICS[key][1]}"]
 
     mode = "치수 입력" if s.target_ohm is None else f"선폭 역산 · 목표 {s.target_ohm:g} Ω"
     item = slide("01 / 전송선 계산 결과", f"{KINDS[g.kind]}  ·  {mode}  ·  {datetime.now():%Y-%m-%d %H:%M}")
@@ -705,17 +806,17 @@ def save_pptx(path: str | Path, snapshot: Snapshot):
          f"기준 {s.reference_ohm:g} Ω  ·  선로 길이 {s.length_m * 1000:g} mm  ·  {frequency_text(s.freq_hz[0])} ~ {frequency_text(s.freq_hz[-1])}",
          17, MUTED)
 
-    item = slide("02 / 입력 조건 - 단면 치수", "w·s·c는 도체 하부 기준 · 상부 폭은 측벽각으로 계산")
-    rows = [["구조", KINDS[g.kind]], ["하부 폭 w / 두께 t", f"{g.width_um:g} / {g.thickness_um:g} µm"],
-            ["상부 폭 / 측벽각 θ", f"{g.width_um - 2*g.thickness_um/math.tan(math.radians(g.angle_deg)):.4g} µm / {g.angle_deg:g}°"],
-            ["하부 유전체 높이 h₁", f"{g.bottom_um:g} µm"],
-            ["상부 유전체 높이 h₂", f"{g.top_um:g} µm" if "microstrip" not in g.kind else "해당 없음 · 상부 공기"],
-            ["도체 간격 s", f"{g.gap_um:g} µm" if g.kind.startswith("coupled_") else "해당 없음"],
-            ["동일 층 접지 / 간격 c", f"사용 / {g.clearance_um:g} µm" if g.shield else "사용 안 함"],
+    item = slide("02 / 입력 조건 - 단면 치수", "W·S·G는 도선 하부 기준 · 상부 폭은 측벽 각도로 계산")
+    rows = [["구조", KINDS[g.kind]], ["하부 선폭 W / 구리 두께 T", f"{g.width_um:g} / {g.thickness_um:g} µm"],
+            ["상부 폭 / 측벽 각도 θ", f"{g.width_um - 2*g.thickness_um/math.tan(math.radians(g.angle_deg)):.4g} µm / {g.angle_deg:g}°"],
+            ["하부 유전체 높이 H₁", f"{g.bottom_um:g} µm"],
+            ["상부 유전체 높이 H₂", f"{g.top_um:g} µm" if "microstrip" not in g.kind else "해당 없음 · 상부 공기"],
+            ["도선 간격 S", f"{g.gap_um:g} µm" if g.kind.startswith("coupled_") else "해당 없음"],
+            ["동일층 접지 실드 / 간격 G", f"사용 / {g.clearance_um:g} µm" if g.shield else "사용 안 함"],
             ["길이 / 기준 임피던스", f"{s.length_m * 1000:g} mm / {s.reference_ohm:g} Ω"]]
     table(item, ["항목", "입력값"], rows)
 
-    item = slide("03 / 재료와 주파수 - 계산 데이터", "CMX 주파수 표는 로그 주파수 보간 · 범위 밖 끝값 유지 · 단일 기준점과 수동 재료는 상수 적용")
+    item = slide("03 / 재료와 주파수 - 계산 데이터", "CMX 주파수 표는 로그 주파수 보간 · 범위 밖 끝값 유지 · 단일 기준점과 직접 입력 재료는 상수 적용")
     material_rows = []
     for side, name, ers, dfs in (("하부", s.bottom_name, s.bottom_er, s.bottom_df),
                                  ("상부", s.top_name, s.top_er, s.top_df)):
@@ -723,19 +824,19 @@ def save_pptx(path: str | Path, snapshot: Snapshot):
             material_rows.append([side, "공기", "1", "0", "상부 재료 입력 미적용"])
         else:
             material_rows.append([side, name, _number(_at_design(s, ers)), _number(_at_design(s, dfs)),
-                                  f"εr {_number(ers.min())}~{_number(ers.max())}\nDf {_number(dfs.min())}~{_number(dfs.max())}"])
-    table(item, ["위치", "재료", "설계 εr", "설계 Df", "계산 범위 내 변화"], material_rows, y=1.65, h=2.25)
+                                  f"Dk {_number(ers.min())}~{_number(ers.max())}\nDf {_number(dfs.min())}~{_number(dfs.max())}"])
+    table(item, ["위치", "재료", "설계 Dk", "설계 Df", "계산 범위 내 변화"], material_rows, y=1.65, h=2.25)
     text(item, .65, 4.35, 11.9, 1.7,
          f"주파수 범위: {frequency_text(s.freq_hz[0])} ~ {frequency_text(s.freq_hz[-1])}\n"
-         f"계산 점수: {len(s.freq_hz):,}개 / 그래프 가로축: 로그 주파수\n"
+         f"계산 점수: {len(s.freq_hz):,}개\n"
          f"설계 주파수: {frequency_text(s.design_hz)}", 20)
 
     with tempfile.TemporaryDirectory(prefix="zcalc-report-") as folder:
         for number, metric in enumerate(["section", *METRICS], start=4):
-            label = "단면 구조 - 연결과 치수" if metric == "section" else METRICS[metric][0]
+            label = "단면 구조 - 연결과 치수" if metric == "section" else _title(s, metric)
             item = slide(f"{number:02d} / {label}")
             picture = Path(folder) / f"{metric}.png"
-            save_png(picture, s, metric)
+            save_png(picture, s, metric, log_x.get(metric))
             item.shapes.add_picture(str(picture), Inches(1.55), Inches(1.1), height=Inches(5.78))
 
         item = slide("10 / 수치 결과 - 대표 주파수", "원본 계산점 중 대표값 · 설계 주파수는 별도 보간값")
@@ -744,8 +845,8 @@ def save_pptx(path: str | Path, snapshot: Snapshot):
         for index in indices:
             rows.append([frequency_text(s.freq_hz[index]), *[_number(_values(s, key)[index]) for key in METRICS]])
         rows.append(["설계 " + frequency_text(s.design_hz), *[_number(_at_design(s, _values(s, key))) for key in METRICS]])
-        table(item, ["주파수", "Z (Ω)", "DCR (Ω/m)", "RL (dB)", "감쇠 (dB/m)", "IL (dB)"], rows, h=4.25)
-        text(item, .64, 6.15, 12, .45, "DCR: 도체 1개 기준. 차동 Z = 2 × Zodd = Vdiff/I.", 15, MUTED)
+        table(item, ["주파수", "Z (Ω)", "DCR (Ω/m)", "RL (dB)", "전파 손실 (dB/m)", "IL (dB)"], rows, h=4.25)
+        text(item, .64, 6.15, 12, .45, "DCR: 도선 1가닥 기준. 차동 Z = 2 × Zodd = Vdiff/I.", 15, MUTED)
 
         assumptions = _assumptions(s)
         for offset in range(0, len(assumptions), 5):
