@@ -14,17 +14,33 @@ from PySide6.QtWidgets import (
 
 from .engine import C0, Geometry, analyze, synthesize_width
 from .materials import load_cmx, manual_material
-from .visuals import PlotWidget, SectionWidget, Snapshot, save_png, save_pptx
+from .visuals import (KINDS, METRICS, WARNINGS, PlotWidget, Section, SectionWidget, Snapshot,
+                      frequency_text, save_png, save_pptx)
 
 
-KINDS = {
-    "microstrip": "Microstrip", "stripline": "Stripline",
-    "coupled_microstrip": "Coupled microstrip", "coupled_stripline": "Coupled stripline",
+# Field key: (accepts(value), what to enter). The ranges match the engine limits.
+DIMENSION = (lambda v: 0.001 <= v <= 1e7, "0.001–10,000,000 µm 범위의 값")
+POSITIVE = (lambda v: v > 0, "0보다 큰 값")
+FREQUENCY = (lambda v: 1e-12 <= v <= 1e6, "0보다 크고 1,000,000 GHz 이하인 값")
+RULES = {
+    "width_um": DIMENSION, "thickness_um": DIMENSION, "gap_um": DIMENSION,
+    "bottom_um": DIMENSION, "top_um": DIMENSION, "clearance_um": DIMENSION,
+    "angle_deg": (lambda v: 45 <= v <= 90, "45–90° 범위의 값"),
+    "target": POSITIVE, "reference": POSITIVE,
+    "start": FREQUENCY, "stop": FREQUENCY, "design": FREQUENCY,
+    "length": (lambda v: v >= 0, "0 이상의 값"),
 }
-METRICS = {
-    "impedance": "특성 임피던스", "dcr": "단위 길이당 DCR", "return": "반사 손실",
-    "attenuation": "단위 길이당 전파 손실", "insertion": "지정 길이 삽입 손실",
-}
+DK = (lambda v: 1 <= v <= 100, "1–100 범위의 값")
+DF = (lambda v: 0 <= v <= 1, "0–1 범위의 값")
+MANUAL = "직접 입력"
+
+
+class InputError(ValueError):
+    """Unusable text in one input widget; carries the widget to highlight and focus."""
+
+    def __init__(self, widget, message):
+        super().__init__(message)
+        self.widget = widget
 
 
 def configure_style(app):
@@ -52,12 +68,15 @@ def configure_style(app):
         QLabel#sectionTitle { font-size: 14px; font-weight: bold; color: #e9edf2; }
         QLabel#value { color: #f1f5fa; font-family: 'Segoe UI'; font-size: 22px; font-weight: 600; }
         QLabel#primaryValue { color: #9ecaff; font-family: 'Segoe UI'; font-size: 22px; font-weight: 600; }
+        QLabel#value[stale="true"], QLabel#primaryValue[stale="true"] { color: #7d8794; }
+        QLabel#staleNote { color: #f0c27a; }
         QLabel#status { color: #b9c7d9; }
         QLabel#status[error="true"] { color: #ffb6ab; }
         QLineEdit, QComboBox { background: #1d2025; border: 1px solid #525b67;
             border-radius: 4px; padding: 3px 7px; min-height: 21px; }
         QLineEdit:focus, QComboBox:focus, QPushButton:focus, QCheckBox:focus {
             border: 1px solid #8fc1ff; }
+        QLineEdit[invalid="true"] { border: 1px solid #ff8f80; }
         QLineEdit:disabled { color: #a3acb7; background: #292d32; }
         QComboBox QAbstractItemView { background: #23272c; selection-background-color: #386cb0; }
         QPushButton { background: #393e46; color: #ecf0f4; border: 1px solid #575f6a;
@@ -93,14 +112,24 @@ def field(value, name):
     return edit
 
 
-def number(edit):
+def number(edit, rule=None):
+    """Read a field as a finite number that satisfies rule = (accepts, what to enter)."""
+    accepts, expected = rule or (lambda v: True, "유한한 값")
     try:
         value = float(edit.text().strip())
-        if not np.isfinite(value):
-            raise ValueError
-        return value
-    except ValueError as exc:
-        raise ValueError(f"{edit.accessibleName()}에 유한한 숫자를 입력하세요.") from exc
+    except ValueError:
+        value = float("nan")
+    if not np.isfinite(value) or not accepts(value):
+        raise InputError(edit, f"{edit.accessibleName()}: {expected}을 입력하세요.")
+    return value
+
+
+def flag(widget, name, on):
+    """Set a boolean style property and restyle only when it changes."""
+    if bool(widget.property(name)) != on:
+        widget.setProperty(name, on)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
 
 
 def form():
@@ -112,12 +141,18 @@ def form():
 
 
 class MaterialEditor(QWidget):
+    """Library selector whose Dk and Df fields always stay editable.
+
+    Picking a library entry fills the fields with its values at the design
+    frequency. Changing either field switches to manual entry, so a library
+    value is a starting point rather than a lock.
+    """
     changed = Signal()
 
     def __init__(self, title):
         super().__init__()
         self.library = {}
-        self.title = title
+        self.design_hz = 1e9
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
@@ -125,60 +160,101 @@ class MaterialEditor(QWidget):
         self.selector = QComboBox()
         self.selector.setAccessibleName(title)
         self.selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.selector.addItem("직접 입력", None)
+        self.selector.addItem(MANUAL, None)
         layout.addWidget(self.selector)
         row = QHBoxLayout()
         self.er, self.df = field("4.2", title + " Dk"), field("0.018", title + " Df")
         for name, edit in [("Dk", self.er), ("Df", self.df)]:
             row.addWidget(label(name, "subtle"))
             row.addWidget(edit, 1)
-            edit.textChanged.connect(self.changed)
+            edit.textChanged.connect(self._edited)
         layout.addLayout(row)
         self.details = label("", "subtle")
         self.details.setWordWrap(True)
-        self.details.hide()
         layout.addWidget(self.details)
-        self.selector.currentIndexChanged.connect(self._selection)
+        self.selector.currentIndexChanged.connect(self._selected)
+        self._describe()
+
+    def material(self):
+        name = self.selector.currentData()
+        return self.library[name] if name else None
 
     def set_library(self, library):
         previous = self.selector.currentData()
         self.library = library
-        self.selector.blockSignals(True)
+        blocked = self.selector.blockSignals(True)
         self.selector.clear()
-        self.selector.addItem("직접 입력", None)
+        self.selector.addItem(MANUAL, None)
         for name in sorted(library, key=str.casefold):
             self.selector.addItem(name, name)
         self.selector.setCurrentIndex(max(0, self.selector.findData(previous)) if previous else 0)
-        self.selector.blockSignals(False)
-        self._selection()
+        self.selector.blockSignals(blocked)
+        self._selected()
 
-    def _selection(self):
-        is_manual = self.selector.currentIndex() == 0
-        self.er.setVisible(is_manual)
-        self.df.setVisible(is_manual)
-        for widget in self.findChildren(QLabel):
-            if widget.text() in ("Dk", "Df"):
-                widget.setVisible(is_manual)
-        self.details.setVisible(not is_manual)
+    def set_design(self, design_hz):
+        if design_hz != self.design_hz:
+            self.design_hz = design_hz
+            self._fill()
+
+    def _fill(self):
+        """Show the selected library entry at the design frequency without leaving it."""
+        material = self.material()
+        if material is not None:
+            er, df = material.sample(np.array([self.design_hz]))
+            for edit, text in ((self.er, f"{er[0]:.5g}"), (self.df, f"{df[0]:.4g}")):
+                blocked = edit.blockSignals(True)
+                edit.setText(text)
+                edit.blockSignals(blocked)
+        self._describe()
+
+    def _selected(self):
+        self._fill()
         self.changed.emit()
 
-    def sample(self, frequencies):
-        name = self.selector.currentData()
-        material = self.library[name] if name else manual_material(number(self.er), number(self.df))
-        er, df = material.sample(frequencies)
-        return name or "직접 입력", er, df
+    def _edited(self):
+        if self.selector.currentIndex() != 0:
+            blocked = self.selector.blockSignals(True)
+            self.selector.setCurrentIndex(0)
+            self.selector.blockSignals(blocked)
+            self._describe()
+        self.changed.emit()
 
-    def update_detail(self, design_hz):
-        name = self.selector.currentData()
-        if name and design_hz > 0:
-            material = self.library[name]
-            er, df = material.sample(np.array([design_hz]))
-            lo, hi = material.frequency_range_hz
-            reference = (f"{lo / 1e6:g} MHz 단일 기준점 · 상수 적용" if material.is_constant else
-                         f"{lo / 1e6:g}–{hi / 1e6:g} MHz · 범위 밖 끝값 고정")
-            temp = "기본 온도 미지정" if material.temperature_c is None else f"{material.temperature_c:g} °C"
-            self.details.setText(f"{design_hz / 1e9:g} GHz   ·   Dk {er[0]:.5g}   /   Df {df[0]:.4g}"
-                                 f"\n{reference}\n{temp}")
+    def _describe(self):
+        material = self.material()
+        if material is None:
+            self.details.setText("입력한 값을 주파수 전체에 상수로 적용합니다.")
+            return
+        lo, hi = material.frequency_range_hz
+        table = (f"{frequency_text(lo)} 단일 기준점 · 상수 적용" if material.is_constant else
+                 f"{frequency_text(lo)}–{frequency_text(hi)} 표 보간 · 범위 밖 끝값")
+        temperature = "온도 미지정 기본 모델" if material.temperature_c is None else f"{material.temperature_c:g} °C 모델"
+        self.details.setText(f"라이브러리 값 · {frequency_text(self.design_hz)} 기준 표시\n{table}\n{temperature}\n"
+                             "값을 고치면 직접 입력으로 바뀝니다.")
+
+    def mark(self):
+        """Highlight unusable Dk/Df text; return True when both are usable."""
+        usable = True
+        for edit, rule in ((self.er, DK), (self.df, DF)):
+            try:
+                number(edit, rule)
+                flag(edit, "invalid", False)
+            except InputError:
+                flag(edit, "invalid", True)
+                usable = False
+        return usable
+
+    def preview(self):
+        """Material name and Dk at the design frequency (None while the Dk text is unusable)."""
+        try:
+            er = number(self.er, DK)
+        except InputError:
+            er = None
+        return self.selector.currentData() or MANUAL, er
+
+    def sample(self, frequencies):
+        material = self.material() or manual_material(number(self.er, DK), number(self.df, DF))
+        er, df = material.sample(frequencies)
+        return self.selector.currentData() or MANUAL, er, df
 
 
 class Calculation(QThread):
@@ -215,6 +291,8 @@ class Window(QMainWindow):
         self.job = None
         self.dirty = True
         self.pair_mode = False
+        self.section_ok = False
+        self.editing = None
         self.fields = {}
         root = QWidget()
         root.setObjectName("root")
@@ -233,11 +311,9 @@ class Window(QMainWindow):
         self.subtitle = label("전송선 단면 해석", "subtle")
         head.addWidget(self.subtitle)
         head.addStretch()
-        self.png_button = QPushButton("PNG 저장")
         self.report_button = QPushButton("PowerPoint 보고서")
-        head.addWidget(self.png_button)
+        self.report_button.setToolTip("조건·단면·전체 그래프·수치·모델 가정을 담은 .pptx를 저장합니다.")
         head.addWidget(self.report_button)
-        self.png_button.clicked.connect(lambda: self.export(False))
         self.report_button.clicked.connect(lambda: self.export(True))
         body.addWidget(bar)
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -257,6 +333,8 @@ class Window(QMainWindow):
         self.status.setWordWrap(True)
         self.status.setContentsMargins(16, 2, 16, 7)
         body.addWidget(self.status)
+        # Last usable value of every field: the section drawing survives half-typed input.
+        self.last = {key: float(edit.text()) for key, edit in self.fields.items()}
         self.kind.currentIndexChanged.connect(self.kind_changed)
         self.mode.currentIndexChanged.connect(self.mode_changed)
         self.shield.toggled.connect(self.geometry_visibility)
@@ -265,6 +343,8 @@ class Window(QMainWindow):
             edit.returnPressed.connect(self.calculate)
         for editor in (self.bottom, self.top):
             editor.changed.connect(self.mark_dirty)
+            for edit in (editor.er, editor.df):
+                edit.returnPressed.connect(self.calculate)
         self.geometry_visibility()
         self.mode_changed()
         self.shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
@@ -309,18 +389,20 @@ class Window(QMainWindow):
         self.kind.setAccessibleName("전송선 구조")
         for key, name in KINDS.items():
             self.kind.addItem(name, key)
-        stack_layout.addWidget(self.kind)
         self.mode = QComboBox()
         self.mode.setAccessibleName("계산 방식")
         self.mode.addItems(["치수 → 임피던스", "목표 임피던스 → 선폭"])
-        stack_layout.addWidget(self.mode)
+        choices = form()
+        choices.addRow("구조", self.kind)
+        choices.addRow("계산 방식", self.mode)
+        stack_layout.addLayout(choices)
         stack_layout.addSpacing(4)
         stack_layout.addWidget(label("도체 치수", "sectionTitle"))
         self.geo_form = form()
         stack_layout.addLayout(self.geo_form)
         for key, title, value in [
             ("target", "목표 임피던스 (Ω)", 50), ("width_um", "하부 선폭 W (µm)", 180),
-            ("thickness_um", "구리 두께 T (µm)", 18), ("angle_deg", "측벽 각도 (°)", 90),
+            ("thickness_um", "구리 두께 T (µm)", 18), ("angle_deg", "측벽 각도 θ (°)", 90),
             ("gap_um", "도선 간격 S (µm)", 120),
         ]:
             self.add_field(self.geo_form, key, title, value)
@@ -345,7 +427,7 @@ class Window(QMainWindow):
         self.library_button = QPushButton("CMX 파일 열기…")
         self.library_button.clicked.connect(self.browse_library)
         mat_layout.addWidget(self.library_button)
-        self.library_info = label("로컬 CMX를 열거나 Dk·Df를 직접 입력하세요.", "subtle")
+        self.library_info = label("CMX 없이도 아래에 Dk·Df를 직접 입력할 수 있습니다.", "subtle")
         self.library_info.setWordWrap(True)
         mat_layout.addWidget(self.library_info)
         self.bottom, self.top = MaterialEditor("하부 유전체"), MaterialEditor("상부 유전체")
@@ -353,6 +435,9 @@ class Window(QMainWindow):
         mat_layout.addWidget(self.bottom)
         mat_layout.addSpacing(5)
         mat_layout.addWidget(self.top)
+        self.air_note = label("상부 유전체는 스트립라인에서만 사용합니다. 마이크로스트립의 도선 위는 공기입니다.", "subtle")
+        self.air_note.setWordWrap(True)
+        mat_layout.addWidget(self.air_note)
         mat_layout.addStretch()
 
         sweep_layout.addWidget(label("주파수 범위", "sectionTitle"))
@@ -385,6 +470,9 @@ class Window(QMainWindow):
         layout.setSpacing(8)
         heading = QHBoxLayout()
         heading.addWidget(label("설계점 결과", "sectionTitle"))
+        self.stale_note = label("입력 변경됨 · 아래는 이전 계산 결과", "staleNote")
+        self.stale_note.hide()
+        heading.addWidget(self.stale_note)
         heading.addStretch()
         self.condition = label("", "subtle")
         heading.addWidget(self.condition)
@@ -392,7 +480,7 @@ class Window(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(6)
         self.stat_labels, self.stat_values = [], []
-        for i, caption in enumerate(["특성 임피던스", "도선 DCR", "반사 손실", "삽입 손실"]):
+        for i, caption in enumerate(["특성 임피던스", "도선 DCR (1가닥)", "반사 손실", "삽입 손실"]):
             box = QFrame()
             box.setObjectName("stat")
             col = QVBoxLayout(box)
@@ -422,20 +510,37 @@ class Window(QMainWindow):
             header.addStretch()
             if widget is self.section:
                 self.section_save = QPushButton("단면 PNG")
+                self.section_save.setToolTip("지금 보이는 단면 개념도를 PNG로 저장합니다.")
                 self.section_save.clicked.connect(lambda: self.export(False, section=True))
                 header.addWidget(self.section_save)
             else:
+                self.log_axis = QCheckBox("로그 축")
+                self.log_axis.setToolTip("주파수 축을 로그 눈금으로 표시합니다. 그래프 항목마다 따로 기억합니다.")
+                self.log_axis.toggled.connect(self.plot.set_log_x)
+                header.addWidget(self.log_axis)
                 self.metric_selector = QComboBox()
                 self.metric_selector.setAccessibleName("그래프 항목")
-                for key, name in METRICS.items():
+                for key, (name, _, _) in METRICS.items():
                     self.metric_selector.addItem(name, key)
-                self.metric_selector.currentIndexChanged.connect(lambda: self.plot.set_metric(self.metric_selector.currentData()))
+                self.metric_selector.currentIndexChanged.connect(self.metric_changed)
                 header.addWidget(self.metric_selector)
+                self.png_button = QPushButton("그래프 PNG")
+                self.png_button.setToolTip("선택한 그래프를 PNG로 저장합니다.")
+                self.png_button.clicked.connect(lambda: self.export(False))
+                header.addWidget(self.png_button)
             col.addLayout(header)
             col.addWidget(widget, 1)
             split.addWidget(pane)
         split.setSizes([255, 350])
+        self.metric_changed()
         return right
+
+    def metric_changed(self):
+        key = self.metric_selector.currentData()
+        self.plot.set_metric(key)
+        blocked = self.log_axis.blockSignals(True)
+        self.log_axis.setChecked(self.plot.log_x[key])
+        self.log_axis.blockSignals(blocked)
 
     def kind_changed(self):
         # Preserve a custom port or target when switching between SE and differential.
@@ -454,6 +559,7 @@ class Window(QMainWindow):
         self.layer_form.setRowVisible(self.fields["top_um"], strip)
         self.shield_form.setRowVisible(self.fields["clearance_um"], self.shield.isChecked())
         self.top.setVisible(strip)
+        self.air_note.setVisible(not strip)
         self.geometry_note.setText("상·하 기준면 거리는 도선 표면에서 측정합니다." if strip else
                                    "도선 위는 공기입니다. H₁은 하부 접지면까지의 거리입니다.")
         self.port_note.setText(("차동 포트" if pair else "단일 종단 포트") +
@@ -464,30 +570,82 @@ class Window(QMainWindow):
         inverse = self.mode.currentIndex() == 1
         self.geo_form.setRowVisible(self.fields["target"], inverse)
         self.fields["width_um"].setEnabled(not inverse)
+        self.fields["width_um"].setToolTip("목표 임피던스에서 계산해 채웁니다." if inverse else "")
         self.run_button.setText("목표 선폭 계산" if inverse else "임피던스 계산")
         self.mark_dirty()
 
     def set_status(self, message, error=False):
         self.status.setText(message)
-        self.status.setProperty("error", error)
-        self.status.style().unpolish(self.status)
-        self.status.style().polish(self.status)
+        flag(self.status, "error", error)
 
-    def set_exports(self, enabled):
-        for btn in (self.png_button, self.section_save, self.report_button):
-            btn.setEnabled(enabled)
+    def active_fields(self):
+        """Keys of the fields the current structure and mode actually use."""
+        kind = self.kind.currentData()
+        inverse = self.mode.currentIndex() == 1
+        unused = {"width_um" if inverse else "target"}
+        if "coupled" not in kind:
+            unused.add("gap_um")
+        if "stripline" not in kind:
+            unused.add("top_um")
+        if not self.shield.isChecked():
+            unused.add("clearance_um")
+        return self.fields.keys() - unused
+
+    def refresh_preview(self):
+        """Redraw the section from the inputs as they are now, before any calculation."""
+        active = self.active_fields()
+        geometry_ok = True
+        for key, edit in self.fields.items():
+            try:
+                self.last[key] = number(edit, RULES[key])
+                usable = True
+            except InputError:
+                usable = key not in active
+            flag(edit, "invalid", not usable)
+            if key.endswith(("_um", "_deg")):
+                geometry_ok &= usable
+        v = self.last
+        kind = self.kind.currentData()
+        strip = "stripline" in kind
+        geometry = Geometry(kind=kind, width_um=v["width_um"], thickness_um=v["thickness_um"],
+                            bottom_um=v["bottom_um"], top_um=v["top_um"], gap_um=v["gap_um"],
+                            angle_deg=v["angle_deg"], shield=self.shield.isChecked(),
+                            clearance_um=v["clearance_um"])
+        names = []
+        for editor in (self.bottom, self.top):
+            editor.set_design(v["design"] * 1e9)
+            if editor is self.bottom or strip:
+                editor.mark()
+            names.append(editor.preview())
+        (bottom_name, bottom_er), (top_name, top_er) = names
+        inverse = self.mode.currentIndex() == 1
+        self.section.set_section(Section(geometry, bottom_name, top_name if strip else "공기",
+                                         bottom_er, top_er if strip else 1.0,
+                                         width_known=not inverse))
+        self.section_ok = geometry_ok and not inverse and geometry.top_width_um > 0
+
+    def set_dirty(self, dirty):
+        """Track whether the displayed results still belong to the current inputs."""
+        self.dirty = dirty
+        stale = dirty and self.snapshot is not None
+        self.plot.set_stale(stale)
+        self.stale_note.setVisible(stale)
+        for value in self.stat_values:
+            flag(value, "stale", stale)
+        self.update_exports()
+
+    def update_exports(self):
+        idle = self.job is None
+        fresh = idle and self.snapshot is not None and not self.dirty
+        self.png_button.setEnabled(fresh)
+        self.report_button.setEnabled(fresh)
+        self.section_save.setEnabled(idle and self.section_ok)
 
     def mark_dirty(self):
-        self.dirty = True
-        self.set_exports(False)
-        if self.snapshot:
-            self.set_status("입력이 변경되었습니다. 현재 표시된 결과를 갱신하려면 계산을 실행하세요.")
-        try:
-            hz = number(self.fields["design"]) * 1e9
-            for editor in (self.bottom, self.top):
-                editor.update_detail(hz)
-        except ValueError:
-            pass
+        self.refresh_preview()
+        self.set_dirty(True)
+        if self.snapshot and self.job is None:
+            self.set_status("입력이 변경되었습니다. 결과를 갱신하려면 계산을 실행하세요 (Ctrl+Enter).")
 
     def browse_library(self):
         previous = self.settings.value("materials/lastPath", "", type=str)
@@ -499,8 +657,6 @@ class Window(QMainWindow):
     def open_library(self, path, quiet=False):
         try:
             library = load_cmx(path)
-            if not library:
-                raise ValueError("사용 가능한 유전체 항목이 없습니다.")
         except (ValueError, OSError) as exc:
             self.library_info.setText(f"파일 열기 실패 · {exc}")
             if not quiet:
@@ -508,13 +664,14 @@ class Window(QMainWindow):
             return
         for editor in (self.bottom, self.top):
             editor.set_library(library)
-        self.library_info.setText(f"{path.name}   ·   유전체 {len(library)}개")
+        self.library_info.setText(f"{path.name}   ·   유전체 {len(library)}개\n"
+                                  "목록에서 재료를 고르거나 Dk·Df를 직접 입력하세요.")
         self.library_info.setToolTip(str(path))
         self.settings.setValue("materials/lastPath", str(path.resolve()))
 
     def read_inputs(self):
         def value(key):
-            return number(self.fields[key])
+            return number(self.fields[key], RULES[key])
         kind = self.kind.currentData()
         pair, strip = "coupled" in kind, "stripline" in kind
         inverse = self.mode.currentIndex() == 1
@@ -524,32 +681,31 @@ class Window(QMainWindow):
                             gap_um=value("gap_um") if pair else 120.0, shield=self.shield.isChecked(),
                             clearance_um=value("clearance_um") if self.shield.isChecked() else 150.0)
         start, stop, design = (value(key) * 1e9 for key in ("start", "stop", "design"))
-        if not 0 < start < stop or not start <= design <= stop:
-            raise ValueError("시작과 종료 주파수를 오름차순으로 입력하고, 그 범위 안에 설계 주파수를 지정하세요.")
+        if not start < stop:
+            raise InputError(self.fields["stop"], "종료 주파수는 시작 주파수보다 커야 합니다.")
+        if not start <= design <= stop:
+            raise InputError(self.fields["design"], "설계 주파수를 시작과 종료 주파수 사이로 지정하세요.")
         length_m = value("length") / 1000
-        if length_m < 0:
-            raise ValueError("선로 길이는 0 mm 이상이어야 합니다.")
-        if not 1e-3 <= start < stop <= 1e15:
-            raise ValueError("해석 가능한 주파수 범위는 0.001 Hz–1 PHz입니다.")
-        # Include material breakpoints and resolve the finite-line reflection ripple.
+        reference = value("reference")
+        target = value("target") if inverse else None
+        # Include material breakpoints; both axes of the graphs need their own even spacing.
         points = [np.geomspace(start, stop, 321), [design]]
         max_er = 1.
         for editor in (self.bottom, self.top) if strip else (self.bottom,):
-            name = editor.selector.currentData()
-            if name:
-                material = editor.library[name]
+            material = editor.material()
+            if material is not None:
                 knots = material.frequencies_hz
                 active = np.r_[start, knots[(knots > start) & (knots < stop)], stop]
                 points.append(active)
                 max_er = max(max_er, float(material.sample(active)[0].max()))
             else:
-                max_er = max(max_er, number(editor.er))
+                max_er = max(max_er, number(editor.er, DK))
+        # 32 points per wavelength of line length resolve the finite-line reflection ripple.
         intervals = (stop - start) / C0 * (32 * length_m) * np.sqrt(max_er)
         if intervals > 32000:
-            raise ValueError("지정한 길이에서 반사 응답을 분해하려면 주파수 범위를 나누어 계산하세요 "
-                             "(구간당 최대 32,000분할).")
-        if intervals > 0:
-            points.append(np.linspace(start, stop, int(np.ceil(intervals)) + 1))
+            raise InputError(self.fields["length"], "지정한 길이에서 반사 응답을 분해하려면 주파수 범위를 "
+                             "나누어 계산하세요 (구간당 최대 32,000분할).")
+        points.append(np.linspace(start, stop, max(401, int(np.ceil(intervals)) + 1)))
         freq = np.unique(np.concatenate(points))
         bn, be, bd = self.bottom.sample(freq)
         if strip:
@@ -558,13 +714,26 @@ class Window(QMainWindow):
             tn, te, td = "공기", np.ones_like(freq), np.zeros_like(freq)
         return dict(geometry=geometry, freq_hz=freq, bottom_name=bn, bottom_er=be, bottom_df=bd,
                     top_name=tn, top_er=te, top_df=td, length_m=length_m,
-                    reference_ohm=value("reference"), design_hz=design), (value("target") if inverse else None)
+                    reference_ohm=reference, design_hz=design), target
+
+    def show_field(self, widget):
+        """Bring an input with unusable text into view and focus it."""
+        for index in range(self.tabs.count()):
+            if self.tabs.widget(index).isAncestorOf(widget):
+                self.tabs.setCurrentIndex(index)
+        flag(widget, "invalid", True)
+        widget.setFocus()
+        widget.selectAll()
 
     def calculate(self):
         if self.job is not None:
             return
         try:
             inputs, target = self.read_inputs()
+        except InputError as exc:
+            self.set_status(str(exc), True)
+            self.show_field(exc.widget)
+            return
         except ValueError as exc:
             self.set_status(str(exc), True)
             return
@@ -572,23 +741,25 @@ class Window(QMainWindow):
         self.job.ready.connect(self.display_result)
         self.job.failed.connect(lambda message: self.set_status(message, True))
         self.job.finished.connect(self.calculation_finished)
+        # Disabling the inputs moves keyboard focus away; it is given back afterwards.
+        self.editing = self.focusWidget()
         self.sidebar.setEnabled(False)
-        self.set_exports(False)
+        self.update_exports()
         self.set_status("설계 주파수에서 목표 선폭을 찾는 중…" if target is not None else "단면 전계와 주파수 응답 계산 중…")
         self.job.start()
 
     def display_result(self, snap):
         self.snapshot = snap
-        if self.mode.currentIndex() == 1:
+        if snap.target_ohm is not None:
             self.fields["width_um"].setText(f"{snap.geometry.width_um:.8g}")
-        self.dirty = False
-        self.section.set_snapshot(snap)
+        self.section.set_section(snap.section)
+        self.section_ok = True
         self.plot.set_snapshot(snap)
+        self.set_dirty(False)
         i = int(np.argmin(abs(snap.freq_hz - snap.design_hz)))
         r = snap.result
         pair = "coupled" in snap.geometry.kind
         self.stat_labels[0].setText("차동 임피던스" if pair else "특성 임피던스")
-        self.stat_labels[1].setText("도선 DCR (1가닥)")
         for widget, v, unit in zip(self.stat_values, [r.impedance_ohm[i], r.dcr_ohm_m,
                                                      r.return_loss_db[i], r.insertion_loss_db[i]],
                                    ["Ω", "Ω/m", "dB", "dB"]):
@@ -596,13 +767,7 @@ class Window(QMainWindow):
             widget.setText(text)
             widget.setToolTip(text)
         self.condition.setText(f"{snap.design_hz / 1e9:g} GHz   ·   {snap.length_m * 1000:g} mm")
-        conditions = []
-        if any("wavelength" in w for w in r.warnings):
-            conditions.append("단면이 파장의 1/10 초과 · 전파 해석 검증 필요")
-        if any("small-loss" in w for w in r.warnings):
-            conditions.append("Df > 0.1 · 유전체 손실 근사 정확도 저하")
-        if any("Extreme dimension" in w for w in r.warnings):
-            conditions.append("큰 단면 치수비 · 독립 해석 검증 필요")
+        conditions = [WARNINGS[key][0] for key in r.warnings if key in WARNINGS]
         self.set_status("   ·   ".join([KINDS[snap.geometry.kind], f"선폭 {snap.geometry.width_um:.5g} µm",
                         f"{snap.reference_ohm:g} Ω 포트", *conditions, "계산 완료"]), bool(conditions))
 
@@ -610,14 +775,24 @@ class Window(QMainWindow):
         self.job.deleteLater()
         self.job = None
         self.sidebar.setEnabled(True)
-        self.set_exports(self.snapshot is not None and not self.dirty)
+        if self.editing is None:
+            if self.focusWidget() is not None:
+                self.focusWidget().clearFocus()
+        elif self.sidebar.isAncestorOf(self.editing) and self.editing.isEnabled():
+            self.editing.setFocus()
+        self.update_exports()
 
     def export(self, report, section=False):
-        if self.dirty or self.snapshot is None:
+        if section:
+            if not self.section_save.isEnabled():
+                return
+            content, metric = self.section.section, "section"
+        elif self.dirty or self.snapshot is None:
             return
-        metric = "section" if section else self.metric_selector.currentData()
+        else:
+            content, metric = self.snapshot, self.metric_selector.currentData()
         ext, name = ("pptx", "report") if report else ("png", metric)
-        filename = f"Z-Calculator-{self.snapshot.geometry.kind}-{name}.{ext}"
+        filename = f"Z-Calculator-{content.geometry.kind}-{name}.{ext}"
         directory = self.settings.value("exports/directory", str(Path.home() / "Documents"), type=str)
         chosen, _ = QFileDialog.getSaveFileName(self, "PowerPoint 보고서 저장" if report else "PNG 저장",
                                                 str(Path(directory) / filename), f"{ext.upper()} (*.{ext})")
@@ -630,9 +805,9 @@ class Window(QMainWindow):
                 return
         try:
             if report:
-                save_pptx(path, self.snapshot)
+                save_pptx(path, content, self.plot.log_x)
             else:
-                save_png(path, self.snapshot, metric)
+                save_png(path, content, metric, None if section else self.plot.log_x[metric])
             self.settings.setValue("exports/directory", str(path.parent))
             self.set_status(f"저장 완료   ·   {path}")
         except Exception as exc:

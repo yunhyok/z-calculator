@@ -1,0 +1,130 @@
+name: Build
+
+# Every pull request is tested and packaged on Windows with the documented build
+# script. A push to main publishes a release when its version has no tag yet.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  installer:
+    name: Test and build the Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Create the build environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python -m pip install --disable-pip-version-check -r requirements.txt pyinstaller==6.22.3 pytest
+          if ($LASTEXITCODE) { throw "Dependency installation failed." }
+
+      - name: Find or install Inno Setup
+        shell: pwsh
+        run: |
+          function Find-Compiler {
+            @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 7\ISCC.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          }
+          $compiler = Find-Compiler
+          if (-not $compiler) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE) { throw "Inno Setup installation failed." }
+            $compiler = Find-Compiler
+          }
+          if (-not $compiler) { throw "Inno Setup compiler not found." }
+          if (-not (Test-Path -LiteralPath (Join-Path (Split-Path $compiler) "Languages\Korean.isl"))) {
+            throw "This Inno Setup has no Korean.isl; version 6.3 or newer is required."
+          }
+          "INNO_COMPILER=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Test and build the installer
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\packaging\build.ps1 -InnoCompiler $env:INNO_COMPILER
+          if ($LASTEXITCODE) { throw "The build script failed." }
+
+      - name: Start the packaged application
+        shell: pwsh
+        run: |
+          $app = Start-Process -FilePath "dist\ZCalculator\ZCalculator.exe" -PassThru
+          try {
+            $deadline = (Get-Date).AddSeconds(90)
+            do {
+              Start-Sleep -Seconds 2
+              $app.Refresh()
+              if ($app.HasExited) { throw "The packaged application exited with code $($app.ExitCode)." }
+            } until ($app.MainWindowTitle -eq "Z Calculator" -or (Get-Date) -gt $deadline)
+            if ($app.MainWindowTitle -ne "Z Calculator") {
+              throw "The main window did not appear; window title: '$($app.MainWindowTitle)'."
+            }
+          } finally {
+            if (-not $app.HasExited) { $app.Kill() }
+          }
+
+      - name: Write the example report
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python packaging\example_report.py dist\Z-Calculator-100ohm-Example.pptx
+          if ($LASTEXITCODE) { throw "The example report was not written." }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: |
+            dist/Z-Calculator-*-Windows-x64-Setup.exe
+            dist/Z-Calculator-100ohm-Example.pptx
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish the release
+    needs: installer
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
+
+      - name: Publish when this version has no release yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' zcalc/__init__.py)"
+          test -n "$version"
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "v$version is already released; nothing to publish."
+            exit 0
+          fi
+          installer="dist/Z-Calculator-$version-Windows-x64-Setup.exe"
+          test -f "$installer"
+          head -n 1 packaging/RELEASE_NOTES.md | grep -qxF "# Z Calculator v$version"
+          {
+            tail -n +3 packaging/RELEASE_NOTES.md
+            printf '\n설치 파일 SHA-256\n```\n%s\n```\n' "$(sha256sum "$installer" | cut -d ' ' -f 1)"
+          } > notes.md
+          gh release create "v$version" "$installer" dist/Z-Calculator-100ohm-Example.pptx \
+            --target "$GITHUB_SHA" --title "Z Calculator v$version" --notes-file notes.md

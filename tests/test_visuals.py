@@ -14,9 +14,10 @@ from PySide6.QtCore import QSize
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
+from zcalc import engine, visuals
 from zcalc.engine import Geometry
-from zcalc.visuals import (METRICS, PlotWidget, SectionWidget, Snapshot, _at_design,
-                           _x_ticks, _y_ticks, save_png, save_pptx)
+from zcalc.visuals import (LOG_X, METRICS, PlotWidget, Section, SectionWidget, Snapshot, _at_design,
+                           _FrequencyAxis, _image, _linear_ticks, _x_ticks, _y_ticks, save_png, save_pptx)
 
 
 def snapshot(kind="coupled_stripline", shield=True):
@@ -27,7 +28,7 @@ def snapshot(kind="coupled_stripline", shield=True):
         attenuation_db_m=np.sqrt(f / 1e9),
         insertion_loss_db=.1 * np.sqrt(f / 1e9),
         dcr_ohm_m=2.1,
-        warnings=("Cross-section exceeds one tenth wavelength; higher-order/full-wave validation required.",),
+        warnings=("wavelength",),
     )
     return Snapshot(Geometry(kind=kind, shield=shield, angle_deg=75), result, f,
                     "하부 시험 재료", "상부 시험 재료", np.full(f.shape, 4.2),
@@ -60,6 +61,59 @@ class VisualTests(unittest.TestCase):
         self.assertGreater(high, 2.1)
         self.assertTrue(np.all(np.diff(ticks) > 0))
 
+    def test_linear_frequency_axis_uses_round_ticks(self):
+        # A 10 MHz start is within 5% of the span from zero, so the axis starts at zero.
+        self.assertEqual(_linear_ticks(1e7, 2e10)[:3], (0, 2e10, [0, 5e9, 1e10, 1.5e10, 2e10]))
+        self.assertEqual(_linear_ticks(1e7, 2e10)[4], 5e9)
+        axis = _FrequencyAxis(np.array([1e7, 2e10]), log=False)
+        self.assertEqual((axis.labels, axis.title), (["0", "5", "10", "15", "20"], "주파수 (GHz)"))
+        self.assertAlmostEqual(axis.position(1e10), 0.5)
+        # A start far from a round bound keeps the data range: no empty band left of the curve.
+        start, end, major, _, _ = _linear_ticks(3.3e8, 9.1e8)
+        self.assertEqual((start, end), (3.3e8, 9.1e8))
+        self.assertTrue(all(start <= tick <= end for tick in major))
+        axis = _FrequencyAxis(np.array([3.3e8, 9.1e8]), log=False)
+        self.assertEqual((axis.labels, axis.title), (["400", "600", "800"], "주파수 (MHz)"))
+        # Narrow sweeps and 2.5 steps still get distinct labels.
+        narrow = _FrequencyAxis(np.array([1e9, 1.00001e9]), log=False)
+        self.assertEqual(len(set(narrow.labels)), len(narrow.labels))
+        self.assertEqual(narrow.labels[0], "1")
+        self.assertEqual(_FrequencyAxis(np.array([1e9, 1.2e10]), log=False).labels, ["2.5", "5", "7.5", "10", "12.5"])
+        # A sweep one rounding step wide draws instead of dividing by zero.
+        point = _FrequencyAxis(np.array([1e9, np.nextafter(1e9, 2e9)]), log=False)
+        self.assertTrue(0 <= point.position(1e9) <= 1)
+        point.high = point.low
+        self.assertEqual(point.position(1e9), .5)
+        log_axis = _FrequencyAxis(np.array([1e6, 1e10]), log=True)
+        self.assertAlmostEqual(log_axis.position(1e8), 0.5)
+        self.assertEqual(log_axis.labels[0], "1 MHz")
+
+    def test_loss_graphs_default_to_linear_frequency_and_can_switch(self):
+        self.assertEqual({key for key, log in LOG_X.items() if not log}, {"return", "attenuation", "insertion"})
+        s = snapshot()
+        for metric in METRICS:
+            with self.subTest(metric=metric):
+                default = _image(s, metric)
+                self.assertEqual(default, _image(s, metric, LOG_X[metric]))
+                self.assertNotEqual(default, _image(s, metric, not LOG_X[metric]))
+        widget = PlotWidget()
+        widget.set_metric("return")
+        widget.set_log_x(True)
+        widget.set_metric("insertion")
+        self.assertEqual((widget.log_x["return"], widget.log_x["insertion"]), (True, False))
+
+    def test_section_is_drawn_from_inputs_without_a_result(self):
+        section = Section(Geometry(kind="coupled_microstrip", shield=True), "직접 입력", "공기", 4.2, 1.0)
+        pending = replace(section, width_known=False, bottom_er=None)
+        self.assertNotEqual(_image(section, "section"), _image(pending, "section"))
+        self.assertEqual(_image(snapshot(), "section"), _image(snapshot().section, "section"))
+        widget = SectionWidget()
+        widget.resize(550, 210)
+        blank = widget.grab().toImage()
+        widget.set_section(pending)
+        self.assertNotEqual(widget.grab().toImage(), blank)
+        widget.close()
+
     def test_all_six_png_exports_and_geometry_variants(self):
         s = snapshot()
         with tempfile.TemporaryDirectory() as folder:
@@ -82,13 +136,30 @@ class VisualTests(unittest.TestCase):
         for widget in (SectionWidget(), PlotWidget()):
             if isinstance(widget, PlotWidget):
                 widget.set_metric("return")
-            widget.set_snapshot(s)
+                widget.set_snapshot(s)
+            else:
+                widget.set_section(s.section)
             for size in (QSize(550, 210), QSize(820, 245), QSize(1000, 564)):
                 widget.resize(size)
                 rendered = widget.grab().toImage()
                 self.assertFalse(rendered.isNull())
                 self.assertEqual(rendered.deviceIndependentSize().toSize(), size)
             widget.close()
+
+    def test_every_engine_warning_has_display_text(self):
+        self.assertEqual(set(visuals.WARNINGS), set(engine.WARNINGS))
+        self.assertEqual(set(visuals.KINDS), set(engine.KINDS))
+
+    def test_stale_plot_is_marked(self):
+        widget = PlotWidget()
+        widget.set_snapshot(snapshot())
+        for size in (QSize(820, 245), QSize(1000, 564)):
+            widget.resize(size)
+            widget.set_stale(False)
+            fresh = widget.grab().toImage()
+            widget.set_stale(True)
+            self.assertNotEqual(widget.grab().toImage(), fresh)
+        widget.close()
 
     def test_pptx_round_trip_images_tables_and_assumptions(self):
         s = snapshot()

@@ -71,9 +71,9 @@ class MaterialsTests(unittest.TestCase):
         for rows in ["1 4", "1 nan 0.01", "0 4 0.01", "1 4 -0.01", "1 4 .01\n1 5 .01"]:
             with self.subTest(rows=rows), self.assertRaises(ValueError):
                 self.load(f'<Material name="Invalid"><Dielectric><Model>{rows}</Model></Dielectric></Material>')
-        with self.assertRaisesRegex(ValueError, "frequency unit"):
+        with self.assertRaisesRegex(ValueError, "주파수 단위"):
             self.load('<Material name="Bad unit"><Dielectric><Model>1 4 .01</Model></Dielectric></Material>', "rpm")
-        with self.assertRaisesRegex(ValueError, "No populated"):
+        with self.assertRaisesRegex(ValueError, "유전체 모델 데이터가 없습니다"):
             self.load('<Material name="Empty"><Dielectric><Model/></Dielectric></Material>')
 
     def test_dtd_and_wrong_root_are_rejected(self):
