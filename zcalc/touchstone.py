@@ -8,6 +8,9 @@ ports, and the matrix row by row, four pairs per line, for four ports.
 
 Tools disagree on how the four ports of a pair are numbered, so the file
 states it in its comments and the caller chooses between the two usual maps.
+A circuit tool's four-port symbol usually has ports 1 and 2 on one side and 3
+and 4 on the other, which is the "1-3" map; reading a "1-2" file that way pairs
+the two ends of one line and shows crosstalk in place of the transmission.
 """
 
 from __future__ import annotations
@@ -21,9 +24,11 @@ import numpy as np
 # Position in the file -> port of engine.Result.s_parameters (1/2 are the near/far
 # end of one line and 3/4 of the other).
 PORT_ORDERS = {
-    "1-2": (0, 1, 2, 3),  # through paths 1-2 and 3-4; near end is ports 1 and 3
     "1-3": (0, 2, 1, 3),  # through paths 1-3 and 2-4; near end is ports 1 and 2
+    "1-2": (0, 1, 2, 3),  # through paths 1-2 and 3-4; near end is ports 1 and 3
 }
+# File port numbers of the differential pair at the near end and at the far end.
+PAIRS = {"1-3": ((1, 2), (3, 4)), "1-2": ((1, 3), (2, 4))}
 
 
 def port_map(ports: int, order: str = "1-2") -> list[str]:
@@ -31,7 +36,9 @@ def port_map(ports: int, order: str = "1-2") -> list[str]:
     if ports == 2:
         return ["Port 1: near end", "Port 2: far end"]
     ends = {0: "line + (near end)", 1: "line + (far end)", 2: "line - (near end)", 3: "line - (far end)"}
-    return [f"Port {number}: {ends[source]}" for number, source in enumerate(PORT_ORDERS[order], start=1)]
+    near, far = PAIRS[order]
+    return [*(f"Port {number}: {ends[source]}" for number, source in enumerate(PORT_ORDERS[order], start=1)),
+            f"Differential pairs: ports {near[0]} and {near[1]} (near end), ports {far[0]} and {far[1]} (far end)"]
 
 
 def format_touchstone(freq_hz, s_parameters, port_ohm: float, comments=(), order: str = "1-2") -> str:

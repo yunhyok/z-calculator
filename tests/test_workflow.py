@@ -12,7 +12,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog
 from pptx import Presentation
 
-from zcalc.ui import MANUAL, Window, configure_style
+from zcalc.ui import MANUAL, PortOrderDialog, Window, configure_style
 
 CMX = ('<Cadence_Material_Lib><Material name="Demo"><Dielectric><Model>'
        '100 4.3 0.015\n10000 4 0.02</Model></Dielectric></Material></Cadence_Material_Lib>')
@@ -231,23 +231,36 @@ class DesktopWorkflow(unittest.TestCase):
         self.assertEqual(len(data), len(window.snapshot.freq_hz))
         self.assertEqual(len(data[0].split()), 9)
         self.assertTrue(any("Port 2: far end" in line for line in lines))
-        # Four single-ended ports for a pair, with either port numbering.
+        # Four single-ended ports for a pair. The port numbering is asked for with a drawing,
+        # starting from the layout of a four-port symbol: ports 1 and 2 at the near end.
         self.select(window.kind, "coupled_microstrip")
         self.assertFalse(window.touchstone_button.isEnabled())
         self.calculate()
         self.assertEqual([label.text() for label in window.stat_labels[2:]], ["반사 Sdd11", "전송 Sdd21"])
-        texts = {}
-        for order in ("1→2, 3→4", "1→3, 2→4"):
-            path = self.folder / f"pair-{order[:3]}.s4p"
-            with patch.object(QFileDialog, "getSaveFileName") as dialog:
-                dialog.side_effect = lambda *arguments: (str(path), next(
-                    name for name in arguments[3].split(";;") if order in name))
+        dialog = PortOrderDialog(window, window.settings.value("exports/portLayout", "1-3", type=str))
+        self.assertEqual((dialog.order(), list(dialog.choices)), ("1-3", ["1-3", "1-2"]))
+        self.assertFalse(dialog.grab().isNull())
+        dialog.choices["1-2"].setChecked(True)
+        self.assertEqual(dialog.order(), "1-2")
+        texts, offered = {}, []
+        for order in ("1-3", "1-2"):
+            path = self.folder / f"pair-{order}.s4p"
+            with patch("zcalc.ui.choose_port_order", side_effect=lambda parent, current: offered.append(current) or order), \
+                    patch.object(QFileDialog, "getSaveFileName", return_value=(str(path), "")):
                 window.export_touchstone()
             texts[order] = path.read_text(encoding="ascii").splitlines()
-        self.assertEqual(window.settings.value("exports/portOrder"), "1-3")  # offered first next time
-        first, second = texts.values()
-        self.assertIn("# Hz S RI R 50", first)
-        self.assertEqual(len([line for line in first if line[0] not in "!#"]), 4 * len(window.snapshot.freq_hz))
-        self.assertIn("! Port 2: line + (far end)", first)
-        self.assertIn("! Port 2: line - (near end)", second)
-        self.assertNotEqual(first, second)
+        self.assertEqual(offered, ["1-3", "1-3"])  # the first default, then the layout used last
+        self.assertEqual(window.settings.value("exports/portLayout"), "1-2")
+        self.assertIn("근단 포트 1·3, 원단 포트 2·4", window.status.text())
+        symbol, lines = texts["1-3"], texts["1-2"]
+        self.assertIn("# Hz S RI R 50", symbol)
+        self.assertEqual(len([line for line in symbol if line[0] not in "!#"]), 4 * len(window.snapshot.freq_hz))
+        self.assertIn("! Port 2: line - (near end)", symbol)
+        self.assertIn("! Differential pairs: ports 1 and 2 (near end), ports 3 and 4 (far end)", symbol)
+        self.assertIn("! Port 2: line + (far end)", lines)
+        self.assertIn("! Differential pairs: ports 1 and 3 (near end), ports 2 and 4 (far end)", lines)
+        # Cancelling the question writes nothing.
+        with patch("zcalc.ui.choose_port_order", return_value=None), \
+                patch.object(QFileDialog, "getSaveFileName") as save:
+            window.export_touchstone()
+        save.assert_not_called()

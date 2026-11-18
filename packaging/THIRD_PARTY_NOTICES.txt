@@ -1,4 +1,4 @@
-Z Calculator 1.2.0 - third-party notices
+Z Calculator 1.2.1 - third-party notices
 
 This directory contains the license and notice files provided by the installed
 Python dependency distributions, their package metadata, the Python license,

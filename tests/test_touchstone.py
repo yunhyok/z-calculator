@@ -70,8 +70,16 @@ class TouchstoneTests(unittest.TestCase):
         through = abs(s[10, 1, 0])
         _, comments, points = parse(format_touchstone(f, s, 50, order="1-3"))
         self.assertAlmostEqual(abs(points[10][1][2, 0]), through)
-        self.assertEqual(comments[:4], ["Port 1: line + (near end)", "Port 2: line - (near end)",
-                                        "Port 3: line + (far end)", "Port 4: line - (far end)"])
+        self.assertEqual(comments[:5], ["Port 1: line + (near end)", "Port 2: line - (near end)",
+                                        "Port 3: line + (far end)", "Port 4: line - (far end)",
+                                        "Differential pairs: ports 1 and 2 (near end), ports 3 and 4 (far end)"])
+        # Reading that file with the pairs it names gives the differential two-port. Pairing
+        # the ports as the other layout does (ports 1 and 3, 2 and 4) gives something else.
+        matrix = np.array([m for _, m in points])
+        differential = lambda m, near, far: (m[:, far[0], near[0]] - m[:, far[0], near[1]]
+                                             - m[:, far[1], near[0]] + m[:, far[1], near[1]]) / 2
+        np.testing.assert_allclose(differential(matrix, (0, 1), (2, 3)), result.s21, rtol=1e-10, atol=1e-13)
+        self.assertGreater(abs(differential(matrix, (0, 2), (1, 3)) - result.s21).max(), 0.5)
 
     def test_files_are_ascii_and_reject_unusable_data(self):
         s = analyze(Geometry(), [1e9, 2e9], length_m=0.01).s_parameters

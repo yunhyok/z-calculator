@@ -1,5 +1,5 @@
 #define AppName "Z Calculator"
-#define AppVersion "1.2.0"
+#define AppVersion "1.2.1"
 #define AppExe "ZCalculator.exe"
 
 [Setup]
