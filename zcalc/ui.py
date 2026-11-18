@@ -4,18 +4,18 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QSettings, QSize, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut
+from PySide6.QtCore import QLineF, QRectF, QSettings, QSize, Qt, QThread, Signal
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QPalette, QPen, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QRadioButton,
     QScrollArea, QSizePolicy, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from . import __version__
 from .engine import C0, Geometry, analyze, synthesize_width
 from .materials import load_cmx, manual_material
-from .touchstone import save_touchstone
+from .touchstone import PAIRS, PORT_ORDERS, save_touchstone
 from .visuals import (KINDS, METRICS, WARNINGS, PlotWidget, Section, SectionWidget, Snapshot,
                       frequency_text, save_png, save_pptx)
 
@@ -259,6 +259,91 @@ class MaterialEditor(QWidget):
         return self.selector.currentData() or MANUAL, er, df
 
 
+class PortLayout(QWidget):
+    """Drawing of a pair with the four port numbers of one Touchstone port map."""
+
+    def __init__(self, order):
+        super().__init__()
+        self.order = order
+        self.setFixedHeight(84)
+        self.setMinimumWidth(330)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        left, right = 92, self.width() - 92
+        number = {source: file_port for file_port, source in enumerate(PORT_ORDERS[self.order], start=1)}
+        p.setPen(QColor("#b8c0cb"))
+        p.drawText(QRectF(0, 0, 84, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "근단")
+        p.drawText(QRectF(self.width() - 84, 0, 84, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "원단")
+        # Engine ports: 0/1 are the near/far end of line +, 2/3 of line -.
+        for y, name, near, far in ((36, "선로 +", 0, 1), (66, "선로 −", 2, 3)):
+            pen = QPen(QColor("#dfaa70"), 5)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.drawLine(QLineF(left, y, right, y))
+            p.setPen(QColor("#b8c0cb"))
+            p.drawText(QRectF(left, y - 20, right - left, 16), Qt.AlignmentFlag.AlignCenter, name)
+            p.setPen(QColor("#9ecaff"))
+            font = p.font()
+            font.setBold(True)
+            p.setFont(font)
+            p.drawText(QRectF(0, y - 10, 84, 20), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                       f"포트 {number[near]}")
+            p.drawText(QRectF(self.width() - 84, y - 10, 84, 20),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, f"포트 {number[far]}")
+            font.setBold(False)
+            p.setFont(font)
+        p.end()
+
+
+class PortOrderDialog(QDialog):
+    """Asks how the four ports of a pair are numbered in the Touchstone file.
+
+    Tools do not agree, and a file read with the other numbering pairs the two
+    ends of one line: the differential transmission then shows crosstalk.
+    """
+    CAPTIONS = {
+        "1-3": "근단 포트 1·2, 원단 포트 3·4\n왼쪽에 1·2, 오른쪽에 3·4가 있는 4포트 기호와 같은 배치",
+        "1-2": "근단 포트 1·3, 원단 포트 2·4\n선로마다 번호가 이어지는 배치 (선로 + 는 1→2, 선로 − 는 3→4)",
+    }
+
+    def __init__(self, parent, current):
+        super().__init__(parent)
+        self.setWindowTitle("Touchstone 4포트 번호 배치")
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        note = label("파일을 읽을 도구에서 차동쌍으로 묶을 포트와 같은 배치를 고르세요. "
+                     "배치가 다르면 차동 전송(Sdd21) 자리에 누화가 표시됩니다.", "subtle")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.choices = {}
+        for order in PORT_ORDERS:
+            choice = QRadioButton(self.CAPTIONS[order])
+            choice.setChecked(order == current)
+            self.choices[order] = choice
+            layout.addWidget(choice)
+            layout.addWidget(PortLayout(order))
+        if not any(choice.isChecked() for choice in self.choices.values()):
+            next(iter(self.choices.values())).setChecked(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("이 배치로 저장…")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("취소")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addSpacing(6)
+        layout.addWidget(buttons)
+
+    def order(self):
+        return next(order for order, choice in self.choices.items() if choice.isChecked())
+
+
+def choose_port_order(parent, current):
+    """Port map chosen for a four-port file, or None when cancelled."""
+    dialog = PortOrderDialog(parent, current)
+    return dialog.order() if dialog.exec() == QDialog.DialogCode.Accepted else None
+
+
 class Calculation(QThread):
     ready = Signal(object)
     failed = Signal(str)
@@ -314,7 +399,7 @@ class Window(QMainWindow):
         head.addWidget(self.subtitle)
         head.addStretch()
         self.touchstone_button = QPushButton("Touchstone")
-        self.touchstone_button.setToolTip("S파라미터를 Touchstone 파일로 저장합니다. 단일 선로는 .s2p, 차동쌍은 단일 종단 4포트 .s4p입니다.")
+        self.touchstone_button.setToolTip("S파라미터를 Touchstone 파일로 저장합니다. 단일 선로는 .s2p, 차동쌍은 단일 종단 4포트 .s4p이며 포트 번호 배치를 고릅니다.")
         head.addWidget(self.touchstone_button)
         self.touchstone_button.clicked.connect(self.export_touchstone)
         self.report_button = QPushButton("PowerPoint 보고서")
@@ -849,15 +934,16 @@ class Window(QMainWindow):
         snap = self.snapshot
         ports = snap.result.s_parameters.shape[-1]
         ext = f"s{ports}p"
-        # Tools number the four ports of a pair in two ways; the save dialog offers both.
-        orders = {f"Touchstone {ports}포트 (*.{ext})": "1-2"} if ports == 2 else {
-            f"Touchstone 4포트 · 통과 1→2, 3→4 (*.{ext})": "1-2",
-            f"Touchstone 4포트 · 통과 1→3, 2→4 (*.{ext})": "1-3"}
+        order = "1-2"
+        if ports == 4:
+            # Tools number the four ports of a pair in two ways: ask, with a drawing of each.
+            order = choose_port_order(self, self.settings.value("exports/portLayout", "1-3", type=str))
+            if order is None:
+                return
         directory = self.settings.value("exports/directory", str(Path.home() / "Documents"), type=str)
-        previous = self.settings.value("exports/portOrder", "1-2", type=str)
-        chosen, selected = QFileDialog.getSaveFileName(
+        chosen, _ = QFileDialog.getSaveFileName(
             self, "Touchstone 저장", str(Path(directory) / f"Z-Calculator-{snap.geometry.kind}.{ext}"),
-            ";;".join(orders), next((name for name, order in orders.items() if order == previous), ""))
+            f"Touchstone {ports}포트 (*.{ext})")
         if not chosen:
             return
         path = Path(chosen)
@@ -865,14 +951,16 @@ class Window(QMainWindow):
             path = Path(str(path) + "." + ext)
             if path.exists() and QMessageBox.question(self, "기존 파일 교체", f"{path.name} 파일을 교체할까요?") != QMessageBox.StandardButton.Yes:
                 return
-        order = orders.get(selected, "1-2")
         try:
             save_touchstone(path, snap.freq_hz, snap.result.s_parameters, snap.result.port_ohm,
                             self.touchstone_comments(snap), order)
             self.settings.setValue("exports/directory", str(path.parent))
+            layout = ""
             if ports == 4:
-                self.settings.setValue("exports/portOrder", order)
-            self.set_status(f"저장 완료   ·   {path}")
+                self.settings.setValue("exports/portLayout", order)
+                near, far = PAIRS[order]
+                layout = f"   ·   차동쌍: 근단 포트 {near[0]}·{near[1]}, 원단 포트 {far[0]}·{far[1]}"
+            self.set_status(f"저장 완료   ·   {path}{layout}")
         except Exception as exc:
             QMessageBox.warning(self, "저장 실패", str(exc))
 
