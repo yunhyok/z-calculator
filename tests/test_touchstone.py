@@ -83,9 +83,10 @@ class TouchstoneTests(unittest.TestCase):
 
     def test_files_are_ascii_and_reject_unusable_data(self):
         s = analyze(Geometry(), [1e9, 2e9], length_m=0.01).s_parameters
-        text = format_touchstone([1e9, 2e9], s, 50, ["재료 FR-4 µ"])
+        text = format_touchstone([1e9, 2e9], s, 50, ["재료 FR-4 µ\n# second line of the material name"])
         self.assertTrue(text.isascii())
         self.assertIn("FR-4", text)
+        self.assertIn("! # second line of the material name", text.splitlines())
         for arguments in (([1e9], s, 50), ([2e9, 1e9], s, 50), ([1e9, 2e9], s[:, :1, :1], 50),
                           ([1e9, 2e9], np.full_like(s, np.nan), 50)):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):

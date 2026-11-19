@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .engine import C0, Geometry, analyze, synthesize_width
-from .materials import load_cmx, manual_material
+from .engine import C0, COPPER_CONDUCTIVITY_S_M, Geometry, analyze, synthesize_width
+from .materials import Conductor, load_material_library, manual_material
 from .touchstone import PAIRS, PORT_ORDERS, save_touchstone
 from .visuals import (KINDS, METRICS, WARNINGS, PlotWidget, Section, SectionWidget, Snapshot,
                       frequency_text, save_png, save_pptx)
@@ -259,6 +259,84 @@ class MaterialEditor(QWidget):
         return self.selector.currentData() or MANUAL, er, df
 
 
+class ConductorEditor(QWidget):
+    changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.library = {}
+        self.copper = Conductor(name="구리", conductivity_s_m=COPPER_CONDUCTIVITY_S_M, temperature_c=20.0)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        header = QHBoxLayout()
+        header.addWidget(label("도선 재료", "sectionTitle"))
+        header.addStretch()
+        self.copper_button = QPushButton("구리 선택")
+        self.copper_button.setToolTip("기본 구리 전도율(20 °C)로 설정합니다.")
+        header.addWidget(self.copper_button)
+        layout.addLayout(header)
+        self.selector = QComboBox()
+        self.selector.setAccessibleName("도선 재료")
+        self.selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.selector.addItems(["구리 (기본)", MANUAL])
+        layout.addWidget(self.selector)
+        self.sigma = field("", "도선 전도율 (S/m)")
+        self.sigma.setPlaceholderText("3.5e7")
+        self.sigma.setToolTip("S/m 단위로 입력합니다. 예: 35000000 또는 3.5e7")
+        row = form()
+        row.addRow("전도율 σ (S/m)", self.sigma)
+        layout.addLayout(row)
+        self.detail = label("", "subtle")
+        self.detail.setWordWrap(True)
+        layout.addWidget(self.detail)
+        self.selector.currentIndexChanged.connect(self._selected)
+        self.sigma.textChanged.connect(self._edited)
+        self.copper_button.clicked.connect(lambda: self.selector.setCurrentIndex(0))
+        self._selected()
+
+    def set_library(self, library):
+        previous, index = self.selector.currentData(), self.selector.currentIndex()
+        self.library = library
+        blocked = self.selector.blockSignals(True)
+        while self.selector.count() > 2:
+            self.selector.removeItem(self.selector.count() - 1)
+        for name in sorted(library, key=str.casefold):
+            self.selector.addItem(name, name)
+        self.selector.setCurrentIndex(max(1, self.selector.findData(previous)) if index >= 2 else index)
+        self.selector.blockSignals(blocked)
+        self._selected()
+
+    def preset(self):
+        return self.copper if self.selector.currentIndex() == 0 else self.library.get(self.selector.currentData())
+
+    def selection(self):
+        material = self.preset()
+        if material is not None:
+            return material.name, material.conductivity_s_m, material.temperature_c
+        return MANUAL, number(self.sigma, POSITIVE), None
+
+    def _selected(self):
+        material = self.preset()
+        if material is not None:
+            blocked = self.sigma.blockSignals(True)
+            self.sigma.setText(f"{material.conductivity_s_m:.12g}")
+            self.sigma.blockSignals(blocked)
+            source = "기본 구리" if self.selector.currentIndex() == 0 else "CMX"
+            temp = "온도 미지정" if material.temperature_c is None else f"{material.temperature_c:g} °C"
+            source_note = f"{source} · {temp}"
+        else:
+            source_note = MANUAL
+        self.detail.setText(f"{source_note} · 신호선과 접지에 공통 적용 (μr = 1)")
+        self.changed.emit()
+
+    def _edited(self):
+        if self.selector.currentIndex() != 1:
+            self.selector.setCurrentIndex(1)
+        else:
+            self.changed.emit()
+
+
 class PortLayout(QWidget):
     """Drawing of a pair with the four port numbers of one Touchstone port map."""
 
@@ -359,9 +437,11 @@ class Calculation(QThread):
             index = int(np.argmin(abs(p["freq_hz"] - p["design_hz"])))
             props = [p[key] for key in ("bottom_er", "bottom_df", "top_er", "top_df")]
             if self.target is not None:
-                width = synthesize_width(geom, self.target, p["design_hz"], *(v[index] for v in props))
+                width = synthesize_width(geom, self.target, p["design_hz"], *(v[index] for v in props),
+                                         conductivity_s_m=p["conductivity_s_m"])
                 geom = replace(geom, width_um=width)
-            result = analyze(geom, p["freq_hz"], *props, p["length_m"], p["reference_ohm"])
+            result = analyze(geom, p["freq_hz"], *props, p["length_m"], p["reference_ohm"],
+                             conductivity_s_m=p["conductivity_s_m"])
             self.ready.emit(Snapshot(**{**p, "geometry": geom}, result=result, target_ohm=self.target))
         except Exception as exc:
             self.failed.emit(str(exc) or type(exc).__name__)
@@ -436,6 +516,8 @@ class Window(QMainWindow):
             editor.changed.connect(self.mark_dirty)
             for edit in (editor.er, editor.df):
                 edit.returnPressed.connect(self.calculate)
+        self.conductor.changed.connect(self.mark_dirty)
+        self.conductor.sigma.returnPressed.connect(self.calculate)
         self.geometry_visibility()
         self.mode_changed()
         self.shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
@@ -493,7 +575,7 @@ class Window(QMainWindow):
         stack_layout.addLayout(self.geo_form)
         for key, title, value in [
             ("target", "목표 임피던스 (Ω)", 50), ("width_um", "하부 선폭 W (µm)", 180),
-            ("thickness_um", "구리 두께 T (µm)", 18), ("angle_deg", "측벽 각도 θ (°)", 90),
+            ("thickness_um", "도선 두께 T (µm)", 18), ("angle_deg", "측벽 각도 θ (°)", 90),
             ("gap_um", "도선 간격 S (µm)", 120),
         ]:
             self.add_field(self.geo_form, key, title, value)
@@ -514,13 +596,16 @@ class Window(QMainWindow):
         stack_layout.addWidget(self.geometry_note)
         stack_layout.addStretch()
 
-        mat_layout.addWidget(label("유전체 라이브러리", "sectionTitle"))
+        mat_layout.addWidget(label("재료 라이브러리", "sectionTitle"))
         self.library_button = QPushButton("CMX 파일 열기…")
         self.library_button.clicked.connect(self.browse_library)
         mat_layout.addWidget(self.library_button)
-        self.library_info = label("CMX 없이도 아래에 Dk·Df를 직접 입력할 수 있습니다.", "subtle")
+        self.library_info = label("로컬 CMX에서 도체와 유전체를 불러옵니다.", "subtle")
         self.library_info.setWordWrap(True)
         mat_layout.addWidget(self.library_info)
+        mat_layout.addSpacing(5)
+        self.conductor = ConductorEditor()
+        mat_layout.addWidget(self.conductor)
         self.bottom, self.top = MaterialEditor("하부 유전체"), MaterialEditor("상부 유전체")
         mat_layout.addSpacing(5)
         mat_layout.addWidget(self.bottom)
@@ -710,9 +795,15 @@ class Window(QMainWindow):
             names.append(editor.preview())
         (bottom_name, bottom_er), (top_name, top_er) = names
         inverse = self.mode.currentIndex() == 1
+        try:
+            conductor_name, sigma, temp = self.conductor.selection()
+        except InputError:
+            conductor_name, sigma, temp = MANUAL, None, None
+        flag(self.conductor.sigma, "invalid", sigma is None)
         self.section.set_section(Section(geometry, bottom_name, top_name if strip else "공기",
                                          bottom_er, top_er if strip else 1.0,
-                                         width_known=not inverse))
+                                         width_known=not inverse, conductor_name=conductor_name,
+                                         conductivity_s_m=sigma, conductor_temperature_c=temp))
         self.section_ok = geometry_ok and not inverse and geometry.top_width_um > 0
 
     def set_dirty(self, dirty):
@@ -741,23 +832,23 @@ class Window(QMainWindow):
 
     def browse_library(self):
         previous = self.settings.value("materials/lastPath", "", type=str)
-        filename, _ = QFileDialog.getOpenFileName(self, "유전체 라이브러리 열기", previous,
+        filename, _ = QFileDialog.getOpenFileName(self, "재료 라이브러리 열기", previous,
                                                    "Cadence 재료 라이브러리 (*.cmx);;모든 파일 (*)")
         if filename:
             self.open_library(Path(filename))
 
     def open_library(self, path, quiet=False):
         try:
-            library = load_cmx(path)
+            dielectrics, conductors = load_material_library(path)
         except (ValueError, OSError) as exc:
             self.library_info.setText(f"파일 열기 실패 · {exc}")
             if not quiet:
                 QMessageBox.warning(self, "CMX 파일 열기", str(exc))
             return
         for editor in (self.bottom, self.top):
-            editor.set_library(library)
-        self.library_info.setText(f"{path.name}   ·   유전체 {len(library)}개\n"
-                                  "목록에서 재료를 고르거나 Dk·Df를 직접 입력하세요.")
+            editor.set_library(dielectrics)
+        self.conductor.set_library(conductors)
+        self.library_info.setText(f"{path.name}   ·   도체 {len(conductors)}개   ·   유전체 {len(dielectrics)}개")
         self.library_info.setToolTip(str(path))
         self.settings.setValue("materials/lastPath", str(path.resolve()))
 
@@ -780,6 +871,7 @@ class Window(QMainWindow):
         length_m = value("length") / 1000
         reference = value("reference")
         target = value("target") if inverse else None
+        conductor_name, sigma, temp = self.conductor.selection()
         # Include material breakpoints; both axes of the graphs need their own even spacing.
         points = [np.geomspace(start, stop, 321), [design]]
         max_er = 1.
@@ -806,7 +898,8 @@ class Window(QMainWindow):
             tn, te, td = "공기", np.ones_like(freq), np.zeros_like(freq)
         return dict(geometry=geometry, freq_hz=freq, bottom_name=bn, bottom_er=be, bottom_df=bd,
                     top_name=tn, top_er=te, top_df=td, length_m=length_m,
-                    reference_ohm=reference, design_hz=design), target
+                    reference_ohm=reference, design_hz=design, conductor_name=conductor_name,
+                    conductivity_s_m=sigma, conductor_temperature_c=temp), target
 
     def show_field(self, widget):
         """Bring an input with unusable text into view and focus it."""
@@ -924,9 +1017,11 @@ class Window(QMainWindow):
                       if strip else "; air above the trace")
         ports = (f"Single-ended ports of {snap.result.port_ohm:g} ohm (differential {snap.reference_ohm:g} ohm)"
                  if pair else f"Ports of {snap.result.port_ohm:g} ohm")
+        conductor = "Copper" if snap.conductor_name == "구리" else name(snap.conductor_name)
+        temperature = "" if snap.conductor_temperature_c is None else f" at {snap.conductor_temperature_c:g} C"
         return [f"Z Calculator {__version__}: {g.kind.replace('_', ' ')}, uniform line of {snap.length_m * 1000:g} mm",
-                dimensions, materials, ports,
-                "Quasi-TEM model: smooth copper at 20 C with skin effect, no roughness, vias, connectors or radiation"]
+                dimensions, materials, f"Conductor: {conductor}, conductivity {snap.conductivity_s_m:.12g} S/m{temperature}",
+                ports, "Quasi-TEM model: smooth nonmagnetic signal and return conductors with skin effect, no roughness, vias, connectors or radiation"]
 
     def export_touchstone(self):
         if self.dirty or self.snapshot is None or self.snapshot.result.s_parameters is None:

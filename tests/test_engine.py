@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 from scipy.special import ellipk
 
-from zcalc.engine import (C0, COPPER_RHO, EPS0, MU0, Geometry, KINDS, WARNINGS,
+from zcalc.engine import (C0, COPPER_RHO, COPPER_CONDUCTIVITY_S_M, EPS0, MU0, Geometry, KINDS, WARNINGS,
                           analyze, synthesize_width)
 
 
@@ -65,6 +65,84 @@ def skin_resistance_factor(g):
 
 
 class EngineTests(unittest.TestCase):
+    def test_default_conductivity_preserves_all_results(self):
+        self.assertEqual(COPPER_CONDUCTIVITY_S_M, 1 / COPPER_RHO)
+        for kind in KINDS:
+            with self.subTest(kind=kind):
+                g = Geometry(kind=kind)
+                default = analyze(g, [1e6, 1e9, 1e12])
+                explicit = analyze(g, [1e6, 1e9, 1e12], conductivity_s_m=COPPER_CONDUCTIVITY_S_M)
+                for name, value in vars(default).items():
+                    if isinstance(value, np.ndarray):
+                        np.testing.assert_array_equal(value, getattr(explicit, name), err_msg=name)
+                    else:
+                        self.assertEqual(value, getattr(explicit, name), name)
+
+    def test_conductivity_dc_and_skin_scaling_all_modes_and_ports(self):
+        f = [1e-3, 1e12]
+        for kind in KINDS:
+            with self.subTest(kind=kind):
+                g = Geometry(kind=kind, shield=True, clearance_um=75)
+                copper = analyze(g, f, 4, 0, 4, 0)
+                poor = analyze(g, f, 4, 0, 4, 0, conductivity_s_m=COPPER_CONDUCTIVITY_S_M / 4)
+                self.assertAlmostEqual(poor.dcr_ohm_m / copper.dcr_ohm_m, 4)
+                self.assertAlmostEqual(poor.resistance_ohm_m[0] / copper.resistance_ohm_m[0], 4, places=7)
+                self.assertAlmostEqual(poor.resistance_ohm_m[-1] / copper.resistance_ohm_m[-1], 2, places=7)
+                np.testing.assert_array_equal(poor.capacitance_f_m, copper.capacitance_f_m)
+                np.testing.assert_array_equal(poor.quasistatic_impedance_ohm, copper.quasistatic_impedance_ohm)
+                self.assertGreater(poor.attenuation_db_m[-1], copper.attenuation_db_m[-1])
+                self.assertFalse(np.array_equal(poor.s_parameters, copper.s_parameters))
+                self.assertLessEqual(np.linalg.svd(poor.s_parameters, compute_uv=False).max(), 1 + 1e-12)
+                if g.coupled:
+                    even_copper = copper.even_impedance_ohm * copper.even_propagation_constant_m
+                    even_poor = poor.even_impedance_ohm * poor.even_propagation_constant_m
+                    self.assertAlmostEqual(even_poor.real[0] / even_copper.real[0], 4, places=7)
+                    self.assertAlmostEqual(even_poor.real[-1] / even_copper.real[-1], 2, places=7)
+                    s = poor.s_parameters
+                    np.testing.assert_allclose((s[:, 0, 0] - s[:, 0, 2] - s[:, 2, 0] + s[:, 2, 2]) / 2,
+                                               poor.s11, atol=1e-15)
+                    np.testing.assert_allclose((s[:, 1, 0] - s[:, 1, 2] - s[:, 3, 0] + s[:, 3, 2]) / 2,
+                                               poor.s21, atol=1e-15)
+
+    def test_conductivity_extremes_are_finite_or_rejected_cleanly(self):
+        # CMX uses a large finite conductivity for PEC; it is still a finite-loss metal here.
+        for conductivity in (1, 5.8e12, 1e300):
+            with self.subTest(conductivity=conductivity), np.errstate(over="raise", invalid="raise", divide="raise"):
+                result = analyze(Geometry(kind="coupled_stripline"), [1e-3, 1e15],
+                                 conductivity_s_m=conductivity)
+                for value in vars(result).values():
+                    if isinstance(value, np.ndarray):
+                        self.assertTrue(np.all(np.isfinite(value)))
+                self.assertGreater(result.dcr_ohm_m, 0)
+        # A near-insulating finite conductivity can be represented for a large trace.
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            poor = analyze(Geometry(width_um=1e5, thickness_um=1e5, bottom_um=1e5), [1e-3],
+                           length_m=0, conductivity_s_m=1e-300)
+        np.testing.assert_array_equal(poor.s11, 0)
+        np.testing.assert_array_equal(poor.s21, 1)
+        for invalid in (0, -1, float("nan"), float("inf"), float("-inf"), 1e-320,
+                        [1e7], None, "invalid", 10 ** 1000):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "전도율"):
+                analyze(Geometry(), [1e9], conductivity_s_m=invalid)
+        with self.assertRaisesRegex(ValueError, "전도율"):
+            analyze(Geometry(), [1e9], conductivity_s_m=1e-308)
+        with self.assertRaisesRegex(ValueError, "전도율"):
+            synthesize_width(Geometry(), 50, 1e9, conductivity_s_m=0)
+
+    def test_width_synthesis_uses_selected_conductivity(self):
+        conductivity = 1e6
+        for kind in KINDS:
+            with self.subTest(kind=kind):
+                g = Geometry(kind=kind)
+                target = 100 if g.coupled else 50
+                width = synthesize_width(g, target, 1e9, 4, 0, 4, 0,
+                                         conductivity_s_m=conductivity)
+                result = analyze(replace(g, width_um=width), [1e9], 4, 0, 4, 0,
+                                 conductivity_s_m=conductivity)
+                self.assertLess(abs(result.impedance_ohm[0] - target), 0.05)
+                wrong_material = analyze(replace(g, width_um=width), [1e9], 4, 0, 4, 0)
+                self.assertGreater(abs(wrong_material.impedance_ohm[0] - target), 0.1)
+
     def test_thin_microstrip_matches_primary_published_reference(self):
         # 0.01 um approaches the zero-thickness H&J reference; <=2% is an
         # explicit numerical tolerance, not a general accuracy guarantee.
@@ -326,7 +404,7 @@ class EngineTests(unittest.TestCase):
             synthesize_width(Geometry(), 10000, 1e9)
 
     def test_error_messages_name_the_input_and_warnings_use_known_keys(self):
-        with self.assertRaisesRegex(ValueError, "구리 두께 T"):
+        with self.assertRaisesRegex(ValueError, "도선 두께 T"):
             analyze(Geometry(thickness_um=0), [1e9])
         with self.assertRaisesRegex(ValueError, "실드 간격 G"):
             analyze(Geometry(shield=True, clearance_um=float("nan")), [1e9])

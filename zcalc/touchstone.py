@@ -60,7 +60,8 @@ def format_touchstone(freq_hz, s_parameters, port_ohm: float, comments=(), order
     if ports == 4:
         index = list(PORT_ORDERS[order])
         s = s[:, index][:, :, index]
-    lines = [f"! {str(text).encode('ascii', 'replace').decode()}" for text in (*comments, *port_map(ports, order))]
+    lines = [f"! {line.encode('ascii', 'backslashreplace').decode()}"
+             for comment in (*comments, *port_map(ports, order)) for line in str(comment).splitlines()]
     lines.append(f"# Hz S RI R {port_ohm:.12g}")
     pair = lambda value: f"{value.real:.12e} {value.imag:.12e}"
     if ports == 2:

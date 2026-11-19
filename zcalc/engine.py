@@ -14,7 +14,9 @@ width and bottom edge gap are inputs; sidewall angle is measured from the
 horizontal. Optional infinite grounded coplanar rails begin clearance_um from
 the outside bottom edges, with the same thickness and rectangular sidewalls.
 
-Loss: smooth copper, rho=1.724e-8 ohm m at 20 C. DCR is for ONE signal trace.
+Loss: one smooth nonmagnetic conductor material for traces, planes and rails.
+The default is copper, rho=1.724e-8 ohm m at 20 C; conductivity_s_m selects
+another finite, positive conductivity in S/m. DCR is for ONE signal trace.
 The skin-effect limit follows Wheeler's incremental-inductance rule,
 R = (Rs/mu0) dL/dn with every metal surface (trace, planes, rails) receding,
 evaluated as the shape derivative of the vacuum capacitance. A slab coth
@@ -58,6 +60,7 @@ EPS0 = 8.8541878128e-12
 MU0 = 1.25663706212e-6
 C0 = 1.0 / math.sqrt(EPS0 * MU0)
 COPPER_RHO = 1.724e-8
+COPPER_CONDUCTIVITY_S_M = 1 / COPPER_RHO
 KINDS = ("microstrip", "stripline", "coupled_microstrip", "coupled_stripline")
 # Result.warnings keys: conditions under which the quasi-static estimate degrades.
 WARNINGS = {
@@ -93,7 +96,7 @@ class Geometry:
 
     def active_dimensions(self) -> dict[str, float]:
         """Dimensions the selected structure uses, keyed by their on-screen names."""
-        active = {"하부 선폭 W": self.width_um, "구리 두께 T": self.thickness_um,
+        active = {"하부 선폭 W": self.width_um, "도선 두께 T": self.thickness_um,
                   "하부 유전체 H₁": self.bottom_um}
         if self.stripline:
             active["상부 유전체 H₂"] = self.top_um
@@ -114,7 +117,7 @@ class Geometry:
         if not np.isfinite(self.angle_deg) or not 45 <= self.angle_deg <= 90:
             raise ValueError("측벽 각도: 45°–90° 범위의 값을 입력하세요.")
         if self.top_width_um <= max(1e-6, self.width_um * 1e-5):
-            raise ValueError("측벽 각도와 구리 두께에 비해 하부 선폭이 좁아 도선 상부 폭이 남지 않습니다.")
+            raise ValueError("측벽 각도와 도선 두께에 비해 하부 선폭이 좁아 도선 상부 폭이 남지 않습니다.")
         if max(active.values()) / min(active.values()) > 1e5:
             raise ValueError("단면 치수의 최대/최소 비가 격자 한계(100,000:1)를 넘습니다.")
 
@@ -355,7 +358,24 @@ class _Line:
         return 1 / (C0 ** 2 * self.vacuum_capacitance)
 
 
-def _line(section: _Section, f, eb, db, et, dt, rdc: float) -> _Line:
+def _resistivity(conductivity_s_m) -> float:
+    """Validate one finite conductor conductivity and its representable reciprocal."""
+    message = "도체 전도율: 0보다 큰 유한한 S/m 값을 입력하세요."
+    try:
+        if np.ndim(conductivity_s_m) != 0:
+            raise ValueError(message)
+        conductivity = float(conductivity_s_m)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(message) from error
+    if not math.isfinite(conductivity) or conductivity <= 0:
+        raise ValueError(message)
+    rho = 1 / conductivity
+    if not math.isfinite(rho) or rho <= 0:
+        raise ValueError("도체 전도율이 수치 계산 범위를 벗어납니다.")
+    return rho
+
+
+def _line(section: _Section, f, eb, db, et, dt, rdc: float, rho: float) -> _Line:
     """RLGC of the mode a section was solved for; rdc is the DC resistance of its current path."""
     cb, ct = _capacitances(section, eb, et)
     capacitance = cb + ct
@@ -364,22 +384,34 @@ def _line(section: _Section, f, eb, db, et, dt, rdc: float) -> _Line:
     conductance = omega * (cb * db + ct * dt)
     # Skin effect: the resistance rises from rdc to Rs(f) * surface_factor, Rs = sqrt(pi f mu0 rho),
     # and the same internal impedance adds inductance. A slab of equivalent thickness joins the
-    # two limits; where the skin depth is near the copper thickness this crossover is an
+    # two limits; where the skin depth is near the conductor thickness this crossover is an
     # estimate, not a diffusion solve.
-    depth = section.vacuum[2] * COPPER_RHO / rdc
-    z = np.sqrt(1j * omega * MU0 / COPPER_RHO) * depth
-    internal = rdc * z
-    transition = z.real < 20
-    internal[transition] /= np.tanh(z[transition])
-    inductance = 1 / (C0 ** 2 * cvac) + internal.imag / omega
-    series = internal.real + 1j * omega * inductance
-    shunt = conductance + 1j * omega * capacitance
+    if not np.isfinite(rdc) or rdc <= 0:
+        raise ValueError("도체 전도율에 따른 저항이 수치 계산 범위를 벗어납니다.")
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore", under="ignore"):
+        depth = section.vacuum[2] * (rho / rdc)
+        # Separate square roots keep frequency / rho from overflowing for high conductivity.
+        z = (1 + 1j) * (np.sqrt(omega * MU0 / 2) / math.sqrt(rho) * depth)
+        internal = rdc * z
+        transition = (z.real >= 1e-4) & (z.real < 20)
+        internal[transition] /= np.tanh(z[transition])
+        small = z.real < 1e-4
+        internal[small] = rdc * (1 + z[small] ** 2 / 3)
+        inductance = 1 / (C0 ** 2 * cvac) + internal.imag / omega
+        series = internal.real + 1j * omega * inductance
+        shunt = conductance + 1j * omega * capacitance
+        impedance = np.sqrt(series) / np.sqrt(shunt)
+        gamma = np.sqrt(series) * np.sqrt(shunt)
+    if not all(np.all(np.isfinite(value)) for value in (internal, inductance, impedance, gamma)):
+        raise ValueError("도체 전도율에 따른 선로 특성이 수치 계산 범위를 벗어납니다.")
     return _Line(internal.real, inductance, conductance, capacitance, cvac,
-                 np.sqrt(series / shunt), np.sqrt(series * shunt))
+                 impedance, gamma)
 
 
 def _two_port(impedance, gamma, length_m: float, reference_ohm: float):
     """S11 and S21 of a uniform line between two equal real reference impedances."""
+    if length_m == 0:
+        return np.zeros_like(impedance), np.ones_like(impedance)
     # Decaying-wave formulation avoids cosh/sinh overflow on long/lossy lines.
     rho = (impedance - reference_ohm) / (impedance + reference_ohm)
     travel = np.exp(-gamma * length_m)
@@ -388,7 +420,8 @@ def _two_port(impedance, gamma, length_m: float, reference_ohm: float):
 
 
 def analyze(geometry: Geometry, freq_hz, bottom_er=4.2, bottom_df=0.02,
-            top_er=4.2, top_df=0.02, length_m=0.1, reference_ohm=50.0, ports=True) -> Result:
+            top_er=4.2, top_df=0.02, length_m=0.1, reference_ohm=50.0, ports=True,
+            *, conductivity_s_m=COPPER_CONDUCTIVITY_S_M) -> Result:
     """Analyze a single or odd differential line; both ports use reference_ohm.
 
     impedance_ohm is Re(Zc) of lossy RLGC. quasistatic_impedance_ohm is
@@ -401,6 +434,9 @@ def analyze(geometry: Geometry, freq_hz, bottom_er=4.2, bottom_df=0.02,
     a pair then also needs its even mode. Frequency must be strictly increasing
     and >0 Hz. Result.warnings holds the keys of WARNINGS that apply. ValueError
     messages are user-facing Korean text.
+    conductivity_s_m applies to all traces, planes and rails, with relative
+    permeability fixed at one; no plating, roughness or temperature correction.
+    Infinity is not interpreted as a perfect electric conductor.
     """
     geometry.validate()
     f = np.asarray(freq_hz, dtype=float)
@@ -411,19 +447,22 @@ def analyze(geometry: Geometry, freq_hz, bottom_er=4.2, bottom_df=0.02,
         raise ValueError("선로 길이: 0 이상의 값을 입력하세요.")
     if not np.isfinite(reference_ohm) or reference_ohm <= 0:
         raise ValueError("양단 기준 임피던스: 0보다 큰 값을 입력하세요.")
+    rho = _resistivity(conductivity_s_m)
     eb = _array(bottom_er, f, "하부 유전체 Dk", 1, 100)
     db = _array(bottom_df, f, "하부 유전체 Df", 0, 1)
     et = _array(top_er, f, "상부 유전체 Dk", 1, 100) if geometry.stripline else np.ones_like(f)
     dt = _array(top_df, f, "상부 유전체 Df", 0, 1) if geometry.stripline else np.zeros_like(f)
     area_m2 = (geometry.width_um + geometry.top_width_um) / 2 * geometry.thickness_um * 1e-12
-    dcr = COPPER_RHO / area_m2
+    dcr = rho / area_m2
+    if not np.isfinite(dcr) or dcr <= 0:
+        raise ValueError("도체 전도율에 따른 저항이 수치 계산 범위를 벗어납니다.")
     # The differential current returns through the other trace: two conductors in series.
-    line = _line(_section(geometry), f, eb, db, et, dt, dcr * (2 if geometry.coupled else 1))
+    line = _line(_section(geometry), f, eb, db, et, dt, dcr * (2 if geometry.coupled else 1), rho)
     s11, s21 = _two_port(line.impedance, line.gamma, length_m, reference_ohm)
     s_parameters = port_ohm = even = None
     if ports and geometry.coupled:
         port_ohm = reference_ohm / 2
-        even = _line(_section(geometry, True), f, eb, db, et, dt, dcr)
+        even = _line(_section(geometry, True), f, eb, db, et, dt, dcr, rho)
         e11, e21 = _two_port(even.impedance, even.gamma, length_m, port_ohm)
         # Each line of the odd mode against port_ohm is the differential line against reference_ohm.
         reflect, near = (e11 + s11) / 2, (e11 - s11) / 2
@@ -455,7 +494,8 @@ def analyze(geometry: Geometry, freq_hz, bottom_er=4.2, bottom_df=0.02,
 
 
 def synthesize_width(geometry: Geometry, target_ohm: float, frequency_hz: float,
-                     bottom_er=4.2, bottom_df=0.02, top_er=4.2, top_df=0.02) -> float:
+                     bottom_er=4.2, bottom_df=0.02, top_er=4.2, top_df=0.02,
+                     *, conductivity_s_m=COPPER_CONDUCTIVITY_S_M) -> float:
     """Return bottom width in um matching Re(lossy Zc) at one design frequency.
 
     The gap, thickness, height, angle and shield clearance remain fixed. The
@@ -466,6 +506,7 @@ def synthesize_width(geometry: Geometry, target_ohm: float, frequency_hz: float,
     replace(geometry, width_um=validation_width).validate()
     if not np.isfinite(target_ohm) or target_ohm <= 0:
         raise ValueError("목표 임피던스: 0보다 큰 값을 입력하세요.")
+    _resistivity(conductivity_s_m)
     inset = 2 * geometry.thickness_um / math.tan(math.radians(geometry.angle_deg))
     height = min(geometry.bottom_um, geometry.top_um) if geometry.stripline else geometry.bottom_um
     lo = max(inset * 1.001, height * 0.01, 0.01)
@@ -473,7 +514,8 @@ def synthesize_width(geometry: Geometry, target_ohm: float, frequency_hz: float,
 
     def error(width):
         result = analyze(replace(geometry, width_um=float(width)), [frequency_hz],
-                         bottom_er, bottom_df, top_er, top_df, length_m=0, ports=False)
+                         bottom_er, bottom_df, top_er, top_df, length_m=0, ports=False,
+                         conductivity_s_m=conductivity_s_m)
         return float(result.impedance_ohm[0] - target_ohm)
 
     elo, ehi = error(lo), error(hi)

@@ -52,6 +52,59 @@ class VisualTests(unittest.TestCase):
             replace(s, bottom_er=np.ones(3))
         with self.assertRaises(ValueError):
             replace(s, reference_ohm=0)
+        for conductivity in (0, -1, np.inf, np.nan):
+            with self.subTest(conductivity=conductivity), self.assertRaises(ValueError):
+                replace(s, conductivity_s_m=conductivity)
+        with self.assertRaises(ValueError):
+            replace(s, conductor_temperature_c=np.nan)
+
+    def test_conductor_metadata_defaults_and_section_propagation(self):
+        s = snapshot()
+        self.assertEqual((s.conductor_name, s.conductivity_s_m, s.conductor_temperature_c),
+                         ("구리", engine.COPPER_CONDUCTIVITY_S_M, 20))
+        other = replace(s, conductor_name="합성 알루미늄", conductivity_s_m=3.5e7,
+                        conductor_temperature_c=65)
+        self.assertEqual((other.section.conductor_name, other.section.conductivity_s_m,
+                          other.section.conductor_temperature_c), ("합성 알루미늄", 3.5e7, 65))
+        pending = replace(other.section, conductivity_s_m=None)
+        self.assertIn("입력 필요", visuals._conductor_label(pending))
+        self.assertNotEqual(_image(other.section, "section"), _image(s.section, "section"))
+
+    def test_non_copper_png_and_pptx_record_applied_material_without_stale_assumptions(self):
+        s = replace(snapshot(), conductor_name="합성 알루미늄", conductivity_s_m=3.5e7,
+                    conductor_temperature_c=65)
+        with tempfile.TemporaryDirectory() as folder:
+            for metric in ("dcr", "section"):
+                path = Path(folder) / f"{metric}.png"
+                with patch("zcalc.visuals._text", wraps=visuals._text) as draw_text:
+                    save_png(path, s, metric)
+                labels = "\n".join(str(call.args[5]) for call in draw_text.call_args_list)
+                self.assertIn("합성 알루미늄", labels)
+                self.assertIn("3.5e+07 S/m", labels)
+                self.assertIn("기준 온도 65°C", labels)
+                png = QImage(str(path))
+                self.assertEqual(png.text("Conductor"), "합성 알루미늄")
+                self.assertEqual(float(png.text("ConductivitySPerM")), 3.5e7)
+                self.assertEqual(png.text("ConductorSourceTemperatureC"), "65")
+            for temperature in (65, None):
+                with self.subTest(temperature=temperature):
+                    material = replace(s, conductor_temperature_c=temperature)
+                    path = Path(folder) / "material.pptx"
+                    save_pptx(path, material)
+                    text = "\n".join(shape.text for slide in Presentation(path).slides
+                                     for shape in slide.shapes if shape.has_text_frame)
+                    table_text = "\n".join(cell.text for slide in Presentation(path).slides
+                                           for shape in slide.shapes if shape.has_table
+                                           for row in shape.table.rows for cell in row.cells)
+                    self.assertIn("합성 알루미늄", text)
+                    self.assertIn("3.5e+07 S/m", text)
+                    self.assertIn("μr = 1", text)
+                    self.assertIn("신호·접지", text)
+                    self.assertIn("온도 보정 없이", text)
+                    self.assertIn("기준 온도 " + ("65°C" if temperature is not None else "미지정"), text)
+                    self.assertNotIn("구리", text + table_text)
+                    self.assertNotIn("동박", text + table_text)
+                    self.assertNotIn("20°C", text + table_text)
 
     def test_log_interpolation_and_ticks(self):
         s = replace(snapshot(), design_hz=np.sqrt(1e6 * 1e10))

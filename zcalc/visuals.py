@@ -15,6 +15,8 @@ from PySide6.QtCore import QLineF, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QApplication, QSizePolicy, QWidget
 
+from zcalc.engine import COPPER_CONDUCTIVITY_S_M
+
 
 BACKGROUND = "#202226"
 PANEL = "#2b2e34"
@@ -64,6 +66,9 @@ class Section:
     bottom_er: float | None = None  # Dk at the design frequency, None if not entered yet
     top_er: float | None = None
     width_known: bool = True  # False while the width still has to be synthesized
+    conductor_name: str = "구리"
+    conductivity_s_m: float | None = COPPER_CONDUCTIVITY_S_M
+    conductor_temperature_c: float | None = 20.0
 
 
 @dataclass
@@ -81,6 +86,9 @@ class Snapshot:
     reference_ohm: float
     design_hz: float
     target_ohm: float | None = None
+    conductor_name: str = "구리"
+    conductivity_s_m: float = COPPER_CONDUCTIVITY_S_M
+    conductor_temperature_c: float | None = 20.0
 
     def __post_init__(self):
         self.freq_hz = np.asarray(self.freq_hz, dtype=float)
@@ -96,6 +104,10 @@ class Snapshot:
             raise ValueError("선로 길이는 0 이상의 유한한 값이어야 합니다.")
         if not math.isfinite(self.reference_ohm) or self.reference_ohm <= 0:
             raise ValueError("기준 임피던스는 양수여야 합니다.")
+        if not math.isfinite(self.conductivity_s_m) or self.conductivity_s_m <= 0:
+            raise ValueError("도체 전도율은 양수인 유한한 값이어야 합니다.")
+        if self.conductor_temperature_c is not None and not math.isfinite(self.conductor_temperature_c):
+            raise ValueError("전도율 기준 온도는 유한한 값이어야 합니다.")
         for key in ("bottom_er", "bottom_df", "top_er", "top_df"):
             values = np.asarray(getattr(self, key), dtype=float)
             if values.ndim == 0:
@@ -107,7 +119,9 @@ class Snapshot:
     @property
     def section(self) -> Section:
         return Section(self.geometry, self.bottom_name, self.top_name,
-                       _at_design(self, self.bottom_er), _at_design(self, self.top_er))
+                       _at_design(self, self.bottom_er), _at_design(self, self.top_er),
+                       conductor_name=self.conductor_name, conductivity_s_m=self.conductivity_s_m,
+                       conductor_temperature_c=self.conductor_temperature_c)
 
 
 def frequency_text(value: float, digits: int | None = None) -> str:
@@ -240,6 +254,14 @@ def _material_label(side: str, name: str, er: float | None) -> str:
     return f"{side} {name}" + ("" if er is None else f" · Dk {_number(er)}")
 
 
+def _conductor_label(content: Snapshot | Section) -> str:
+    conductivity = ("입력 필요" if content.conductivity_s_m is None
+                    else f"{content.conductivity_s_m:.6g} S/m")
+    temperature = ("미지정" if content.conductor_temperature_c is None
+                   else f"{content.conductor_temperature_c:g}°C")
+    return f"도체: {content.conductor_name} · σ = {conductivity} · 기준 온도 {temperature}"
+
+
 class SectionWidget(_DrawingWidget):
     """Dimensioned conceptual section. Display axes are independently scaled."""
 
@@ -261,7 +283,7 @@ class SectionWidget(_DrawingWidget):
         coupled = g.kind.startswith("coupled_")
         stripline = "microstrip" not in g.kind
         width_text = f"W {g.width_um:g}" if s.width_known else "W 역산"
-        _text(p, 12, 5, width - 24, 26, KINDS[g.kind] + " · 단면 개념도", 11, bold=True)
+        _text(p, 12, 5, width - 24, 26, f"{KINDS[g.kind]} · 도체 {s.conductor_name}", 11, bold=True)
         left, right, top, bottom = 79, width - 20, 57, height - 64
         height_fraction = np.clip(g.top_um / (g.top_um + g.bottom_um), .35, .65) if stripline else .44
         trace_top = top + (bottom - top - 11) * height_fraction
@@ -348,7 +370,7 @@ class SectionWidget(_DrawingWidget):
         top_width = g.width_um - 2 * g.thickness_um / math.tan(math.radians(g.angle_deg))
         _text(p, 35, 20, 1000, 42, KINDS[g.kind] + " · 단면 구조", 23, bold=True)
         _text(p, 35, 65, 1000, 28, "치수 단위 µm · 개념도 · 가로/세로 축척 다름", 11, MUTED)
-        # Independent display scales keep thin copper visible; dimensions remain physical values.
+        # Independent display scales keep thin conductors visible; dimensions remain physical values.
         extent = (2 * g.width_um + g.gap_um if coupled else g.width_um)
         if g.shield:
             extent += 2 * (g.clearance_um + .35 * g.width_um)
@@ -418,6 +440,7 @@ class SectionWidget(_DrawingWidget):
         if g.shield:
             description += "     G: 바깥 도선 하부 가장자리~동일층 접지 실드 간격"
         _text(p, 35, 559, 1030, 28, description, 11, MUTED)
+        _text(p, 35, 590, 1030, 24, _conductor_label(s), 10, MUTED)
 
 
 def _y_ticks(values: np.ndarray):
@@ -662,6 +685,7 @@ class PlotWidget(_DrawingWidget):
             _text(p, x-43, rect.bottom()+5, 86, 20, text, 8, MUTED,
                   align=Qt.AlignmentFlag.AlignCenter)
         _text(p, 8, 29, 58, 20, unit, 8.5, MUTED)
+        _text(p, 75, 30, width-95, 18, _conductor_label(s), 8, MUTED)
         p.save()
         p.setClipRect(rect.adjusted(-1, -1, 1, 1))
         p.setPen(QPen(QColor(accent), 2))
@@ -698,6 +722,7 @@ class PlotWidget(_DrawingWidget):
         _text(p, 35, 65, 1030, 28,
               f"{KINDS[s.geometry.kind]}   ·   설계 {frequency_text(s.design_hz)}   ·   길이 {s.length_m * 1000:g} mm   ·   기준 {s.reference_ohm:g} Ω",
               11, MUTED)
+        _text(p, 135, 99, 930, 24, _conductor_label(s), 10, MUTED)
         rect = QRectF(112, 133, 918, 355)
         p.fillRect(rect, QColor("#191d23"))
         low, high, yticks = _y_ticks(values)
@@ -741,7 +766,7 @@ class PlotWidget(_DrawingWidget):
             _text(p, rect.x(), rect.bottom() - 36, rect.width() - 14, 28, "이전 결과 · 입력이 바뀌어 다시 계산 필요",
                   12, AMBER, align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         notes = {
-            "impedance": "손실 RLGC 모델의 Re(Zc) · 차동 Z = 2 × Zodd · 구리색 점선: 설계 주파수",
+            "impedance": "손실 RLGC 모델의 Re(Zc) · 차동 Z = 2 × Zodd · 점선: 설계 주파수",
             "dcr": "도선 1가닥의 단위 길이 DC 저항 · 주파수에 무관 · 차동 루프는 2가닥 합산",
             "s11": "20 log₁₀|S₁₁| · 0 dB에 가까울수록 반사 큼 · 양단 동일 기준 포트 · 차동쌍은 Sdd11",
             "attenuation": "진행파의 단위 길이 손실 · 도체(표피 효과) 및 유전체 손실 포함",
@@ -779,6 +804,10 @@ def _image(content: Snapshot | Section, metric: str, log_x: bool | None = None,
     finally:
         p.end()
         widget.deleteLater()
+    image.setText("Conductor", content.conductor_name)
+    image.setText("ConductivitySPerM", "" if content.conductivity_s_m is None else f"{content.conductivity_s_m:.12g}")
+    image.setText("ConductorSourceTemperatureC", "" if content.conductor_temperature_c is None
+                  else f"{content.conductor_temperature_c:g}")
     return image
 
 
@@ -813,11 +842,13 @@ def _assumptions(snapshot: Snapshot) -> list[str]:
     generic = [
         "균일한 직선 전송선의 준정적 단면 근사. 단면도는 치수 설명용이며 가로/세로 축척 다름.",
         "마이크로스트립 상부는 공기. 스트립라인은 위·아래 유전체와 두 접지면 적용.",
-        "스트립라인의 도선 밖 재료 경계는 구리 두께의 중앙. 마이크로스트립 재료 경계는 구리 하부.",
+        "스트립라인의 도체 밖 재료 경계는 도체 두께의 중앙. 마이크로스트립 재료 경계는 도체 하부.",
         "W와 S는 도선 하부 기준. 측벽 각도 90°는 직사각형. 동일층 접지 실드는 바깥 도선에서 G만큼 이격.",
         "차동 Z는 2×Zodd = Vdiff/I. 표시 임피던스는 손실 RLGC 모델의 Re(Zc). DCR은 도선 1가닥 기준.",
         "S11과 S21은 입력·출력의 동일한 기준 임피던스에 연결한 지정 길이 선로의 20 log₁₀|S| (0 dB 이하). 차동쌍은 Sdd11·Sdd21.",
-        "구리는 20°C 평활 표면 가정. 도체 저항은 DC에서 표피 효과 영역(√f)으로 이어지며 고주파 극한은 증분 인덕턴스 법칙. 이상적인 무한 폭 접지의 DC 저항은 0.",
+        _conductor_label(snapshot) + ". 온도 보정 없이 지정 전도율 적용.",
+        "신호·접지 도체에 동일한 재료와 전도율 적용. 평활 표면·비자성체(μr = 1) 가정.",
+        "도체 저항은 DC에서 표피 효과 영역(√f)으로 이어지며 고주파 극한은 증분 인덕턴스 법칙. 이상적인 무한 폭 접지의 DC 저항은 0.",
         "거칠기·비아·커넥터·굽힘·방사·이방성·고차 모드 제외. 실제 설계는 필드 해석/측정으로 확인할 것.",
     ]
     return [*generic, *(WARNINGS[key][1] for key in getattr(snapshot.result, "warnings", ()) if key in WARNINGS)]
@@ -917,7 +948,7 @@ def save_pptx(path: str | Path, snapshot: Snapshot, log_x: dict[str, bool] | Non
          17, MUTED)
 
     item = slide("02 / 입력 조건 - 단면 치수", "W·S·G는 도선 하부 기준 · 상부 폭은 측벽 각도로 계산")
-    rows = [["구조", KINDS[g.kind]], ["하부 선폭 W / 구리 두께 T", f"{g.width_um:g} / {g.thickness_um:g} µm"],
+    rows = [["구조", KINDS[g.kind]], ["하부 선폭 W / 도체 두께 T", f"{g.width_um:g} / {g.thickness_um:g} µm"],
             ["상부 폭 / 측벽 각도 θ", f"{g.width_um - 2*g.thickness_um/math.tan(math.radians(g.angle_deg)):.4g} µm / {g.angle_deg:g}°"],
             ["하부 유전체 높이 H₁", f"{g.bottom_um:g} µm"],
             ["상부 유전체 높이 H₂", f"{g.top_um:g} µm" if "microstrip" not in g.kind else "해당 없음 · 상부 공기"],
@@ -936,10 +967,11 @@ def save_pptx(path: str | Path, snapshot: Snapshot, log_x: dict[str, bool] | Non
             material_rows.append([side, name, _number(_at_design(s, ers)), _number(_at_design(s, dfs)),
                                   f"Dk {_number(ers.min())}~{_number(ers.max())}\nDf {_number(dfs.min())}~{_number(dfs.max())}"])
     table(item, ["위치", "재료", "설계 Dk", "설계 Df", "계산 범위 내 변화"], material_rows, y=1.65, h=2.25)
-    text(item, .65, 4.35, 11.9, 1.7,
-         f"주파수 범위: {frequency_text(s.freq_hz[0])} ~ {frequency_text(s.freq_hz[-1])}\n"
-         f"계산 점수: {len(s.freq_hz):,}개\n"
-         f"설계 주파수: {frequency_text(s.design_hz)}", 20)
+    text(item, .65, 4.2, 11.9, .47, _conductor_label(s), 18)
+    text(item, .65, 4.8, 11.9, .4, "신호·접지 동일 재료 · μr = 1 · 온도 보정 없이 지정 전도율 적용", 16, MUTED)
+    text(item, .65, 5.45, 11.9, .45,
+         f"주파수 범위: {frequency_text(s.freq_hz[0])} ~ {frequency_text(s.freq_hz[-1])} · {len(s.freq_hz):,}개", 18)
+    text(item, .65, 6.05, 11.9, .45, f"설계 주파수: {frequency_text(s.design_hz)}", 18)
 
     with tempfile.TemporaryDirectory(prefix="zcalc-report-") as folder:
         for number, metric in enumerate(["section", *METRICS], start=4):

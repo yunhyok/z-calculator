@@ -12,6 +12,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog
 from pptx import Presentation
 
+from zcalc.engine import COPPER_CONDUCTIVITY_S_M
 from zcalc.ui import MANUAL, PortOrderDialog, Window, configure_style
 
 CMX = ('<Cadence_Material_Lib><Material name="Demo"><Dielectric><Model>'
@@ -52,6 +53,47 @@ class DesktopWorkflow(unittest.TestCase):
 
     def select(self, combo, data):
         combo.setCurrentIndex(combo.findData(data))
+
+    def test_conductor_cmx_manual_override_and_one_click_copper(self):
+        window, editor = self.window, self.window.conductor
+        self.calculate()
+        copper = window.snapshot
+        self.assertEqual((copper.conductor_name, copper.conductivity_s_m), ("구리", COPPER_CONDUCTIVITY_S_M))
+        self.cmx.write_text(CMX.replace("</Cadence_Material_Lib>",
+                            '<Material name="Test metal"><Metal><Model>20 2.5e7</Model></Metal></Material>'
+                            '</Cadence_Material_Lib>'))
+        window.open_library(self.cmx)
+        self.select(editor.selector, "Test metal")
+        self.assertFalse(window.touchstone_button.isEnabled())
+        self.assertEqual(window.section.section.conductor_name, "Test metal")
+        self.calculate()
+        metal = window.snapshot
+        self.assertEqual((metal.conductivity_s_m, metal.conductor_temperature_c), (2.5e7, 20))
+        self.assertAlmostEqual(metal.result.dcr_ohm_m / copper.result.dcr_ohm_m, COPPER_CONDUCTIVITY_S_M / 2.5e7)
+        self.assertGreater(metal.result.attenuation_db_m[-1], copper.result.attenuation_db_m[-1])
+        file = self.folder / "metal.s2p"
+        with patch.object(QFileDialog, "getSaveFileName", return_value=(str(file), "")):
+            window.export_touchstone()
+        self.assertIn("Test metal, conductivity 25000000 S/m at 20 C", file.read_text("ascii"))
+        editor.sigma.setText("-1")
+        window.calculate()
+        self.assertTrue(editor.sigma.property("invalid"))
+        self.assertEqual(window.tabs.currentIndex(), 1)
+        self.assertIsNone(window.job)
+        editor.sigma.setText("8e6")
+        self.assertEqual(editor.selector.currentText(), MANUAL)
+        window.mode.setCurrentIndex(1)
+        self.calculate()
+        direct = window.snapshot
+        self.assertEqual((direct.conductor_name, direct.conductivity_s_m, direct.conductor_temperature_c),
+                         (MANUAL, 8e6, None))
+        area = direct.geometry.width_um * direct.geometry.thickness_um * 1e-12
+        self.assertAlmostEqual(direct.result.dcr_ohm_m, 1 / (8e6 * area))
+        k = np.searchsorted(direct.freq_hz, direct.design_hz)
+        self.assertAlmostEqual(direct.result.impedance_ohm[k], direct.target_ohm, delta=0.05)
+        editor.copper_button.click()
+        self.assertEqual(editor.selection(), ("구리", COPPER_CONDUCTIVITY_S_M, 20))
+        self.assertFalse(window.report_button.isEnabled())
 
     def test_import_synthesize_plot_export(self):
         self.window.open_library(self.cmx)
